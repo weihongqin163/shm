@@ -163,6 +163,14 @@ int shm_yuv_write_one_frame(ShmYuvMap *m, const char *userid, uint32_t seq,
     return -10002;
   }
 
+  // check buffer size to avoid overflowing yuv_data
+  size_t yuv_data_size =
+  (size_t)width * (size_t)height * 3u / 2u;
+  if (yuv_data_size > SHM_YUV_SIZE) {
+    return -10004;
+  }
+
+
   // find empty slot
   unsigned pub = atomic_load_explicit(&r->active_slot, memory_order_relaxed);
   unsigned widx = (pub == 0u) ? 1u : 0u;
@@ -187,12 +195,7 @@ int shm_yuv_write_one_frame(ShmYuvMap *m, const char *userid, uint32_t seq,
   s->sequence = seq;
 
 
-  /* Copy YUV into slot; clamp to SHM_YUV_SIZE to avoid overflowing yuv_data. */
-  size_t yuv_data_size =
-      (size_t)width * (size_t)height * 3u / 2u;
-  if (yuv_data_size > SHM_YUV_SIZE) {
-    yuv_data_size = SHM_YUV_SIZE;
-  }
+  // Copy YUV into slot
   memcpy(s->yuv_data, yuv_data, yuv_data_size);
 
   // update state to ready

@@ -31,6 +31,15 @@ int main(int argc, char **argv) {
     userid = argv[2];
   }
 
+  // cal first sequence number
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  
+  uint32_t seq = (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+
+
+ 
+
   ShmYuvMap m;
   if (shm_yuv_open(name, &m) != 0) {
     perror("shm_yuv_open");
@@ -43,14 +52,11 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  uint32_t seq = 1u;
   uint8_t yuv_data[SHM_YUV_SIZE];
   int width = 1920;
   int height = 1080;
   for (;;) {
-    for (size_t i = 0; i < SHM_YUV_SIZE; i++) {
-      yuv_data[i] = (uint8_t)((i ^ seq) & 0xFFu);
-    }
+   
     if (shm_yuv_write_one_frame(&m, userid, seq, yuv_data, width, height) != 0) {
       fprintf(stderr, "shm_yuv_write_one_frame failed\n");
       shm_yuv_close(&m);
