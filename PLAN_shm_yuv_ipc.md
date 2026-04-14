@@ -19,6 +19,8 @@ todos:
     status: completed
 ---
 
+> **Repository status:** `shm_yuv` sources (`shm_yuv.c`, `shm_yuv.h`, `shm_yuv_layout.h`) and YUV demos (`reader_demo.c`, `writer_demo.c`) were removed from this repo. Current IPC is **`agora_shm_ipc`**; see [PLAN_shm_ipc.md](PLAN_shm_ipc.md) and [agora_readme.md](agora_readme.md).
+
 # 双进程 YUV 共享内存（纯 C）设计与文档计划
 
 ## 背景与约束对齐
