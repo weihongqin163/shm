@@ -16,9 +16,13 @@ WRITER := $(BUILD_DIR)/writer_demo
 READER := $(BUILD_DIR)/reader_demo
 SHM_OBJ := $(BUILD_DIR)/shm_yuv.o
 
+AGORA_OBJ := $(BUILD_DIR)/agora_shm_ipc.o
+AGORA_WRITER := $(BUILD_DIR)/agora_writer_demo
+AGORA_READER := $(BUILD_DIR)/agora_reader_demo
+
 .PHONY: all clean
 
-all: $(WRITER) $(READER)
+all: $(WRITER) $(READER) $(AGORA_WRITER) $(AGORA_READER)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -31,6 +35,15 @@ $(WRITER): examples/writer_demo.c $(SHM_OBJ) | $(BUILD_DIR)
 
 $(READER): examples/reader_demo.c $(SHM_OBJ) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ examples/reader_demo.c $(SHM_OBJ) $(LIBS)
+
+$(AGORA_OBJ): src/agora_shm_ipc.c src/agora_shm_ipc.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c src/agora_shm_ipc.c -o $@
+
+$(AGORA_WRITER): examples/agora_writer_demo.c $(AGORA_OBJ) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ examples/agora_writer_demo.c $(AGORA_OBJ) $(LIBS)
+
+$(AGORA_READER): examples/agora_reader_demo.c $(AGORA_OBJ) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ examples/agora_reader_demo.c $(AGORA_OBJ) $(LIBS)
 
 clean:
 	rm -rf $(BUILD_DIR)
