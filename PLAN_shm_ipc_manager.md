@@ -95,9 +95,34 @@ typedef void (*agora_shm_manager_on_frame_fn)(
 
 业务可：`cc ... build/agora_shm_ipc.o build/agora_shm_manager.o -pthread`（Linux 另加 `-lrt`）。
 
+## 示例 `agora_manager_demo`（用法与设计约定）
+
+源码：[examples/agora_manager_demo.c](examples/agora_manager_demo.c)，`make all` 生成 `build/agora_manager_demo`。
+
+**命令行（三参数）：**
+
+```text
+./build/agora_manager_demo <notify_write_bind> <notify_peer_recv> <write_shm_name>
+```
+
+- **`notify_write_bind`**：本进程 **`agora_shm_ipc_notify_writer_init` 的 bind 路径**（写端本地 Unix 路径）。
+- **`notify_peer_recv`**：每次 **`agora_shm_ipc_write` 后 `sendto` 的目标路径**，必须为 **对端进程 manager 的 `notify_reader_init` 绑定路径**。
+- **`write_shm_name`**：本进程 **`agora_shm_ipc_open` + `write` 使用的 POSIX SHM 名**。
+
+**约定（demo 内实现，便于双进程对称配置）：**
+
+- 本进程 **manager** 的接收路径 **不是** 命令行第 4 个参数，而是由 **`notify_write_bind` 追加后缀 `".recv"`** 得到（长度须小于 `sockaddr_un.sun_path`）。因此双进程时：**进程 B 的 `notify_peer_recv` = 进程 A 的 `notify_write_bind` + `".recv"`**，反之亦然。
+
+**双进程对称示例：**
+
+- 进程 A：`./build/agora_manager_demo /tmp/am_a /tmp/am_b.recv /agsh_a`
+- 进程 B：`./build/agora_manager_demo /tmp/am_b /tmp/am_a.recv /agsh_b`
+
+各自创建/附着自己的 `write_shm_name`；**无需** `agora_shm_manager_add` 对端 SHM 即可工作：工作线程收到通知后按头内 **`shm_name` / `payload_size`** **自动 `open` 读附着** 对端段（`ENOENT` 则丢包，见上节）。demo 内 **`payload_size` 固定 4096**。
+
 ## 实施顺序
 
 1. 定稿本 PLAN（本文件）。
 2. 实现 `start` / `close` / 监听线程 / 回调 + **ENOENT 即丢包**。
 3. 实现 `add` / `remove` 与读写角色字段。
-4. **示例**：[`examples/agora_manager_demo.c`](examples/agora_manager_demo.c)（`make all` 生成 `build/agora_manager_demo`）；与 `agora_writer_demo` 共用默认 notify 路径 `/tmp/agora_reader.sock` 即可联调。
+4. **示例**：见上节「示例 `agora_manager_demo`」；与底层 `agora_writer_demo` / `agora_reader_demo` 可独立联调。

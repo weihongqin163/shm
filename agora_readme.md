@@ -29,10 +29,16 @@ make clean && make all
 | `build/agora_shm_ipc.o` | 库对象文件，可链进你的程序 |
 | `build/agora_writer_demo` | 写端示例 |
 | `build/agora_reader_demo` | 读端示例 |
-| `build/agora_manager_demo` | **manager** 示例：单进程监听 notify，按 `shm_name` 动态附着 SHM 并回调（见 [`PLAN_shm_ipc_manager.md`](PLAN_shm_ipc_manager.md)） |
+| `build/agora_manager_demo` | **manager 双进程示例**：三参数指定本端写 notify 路径、对端 manager 接收路径、本进程写的 SHM 名；manager 在本端 **`notify_write_bind` + `".recv"`** 上监听（见下文与 [`PLAN_shm_ipc_manager.md`](PLAN_shm_ipc_manager.md)） |
 | `build/agora_shm_manager.o` | manager 层对象文件，与 `agora_shm_ipc.o`、`-pthread` 一起链接 |
 
 将 `src/agora_shm_ipc.c` 与你的源码一起编译，并保证 `-Isrc` 能包含 `agora_shm_ipc.h`。使用 manager 时需增加 `src/agora_shm_manager.c` 或 `build/agora_shm_manager.o`。
+
+## agora_shm_manager（上层，可选）
+
+- **职责**：单进程内 **一个** `agora_shm_manager_start`：绑定 **读端** `notify_reader_init`，起 **一个** 工作线程 `poll`/`recv` 整帧 [`AgoraShmIpcHeader`](src/agora_shm_ipc.h)，按头里的 **`shm_name` / `payload_size`** 在表内查找或 **自动附着读 SHM**，再 **`agora_shm_ipc_read`**，成功后 **释锁** 调用 **`on_frame`**。写端 **`AgoraShmIpcNotify`** 仍由业务 **`notify_writer_init`** 持有。
+- **表**：最多 **64** 槽、`shm_name` 唯一；可选 **`agora_shm_manager_add` / `remove`** 预登记或移除；对端 SHM 也可仅靠通知 **动态附着**（见 demo）。
+- **设计细节与边界**：[`PLAN_shm_ipc_manager.md`](PLAN_shm_ipc_manager.md)。
 
 ## 概念与约束
 
@@ -95,6 +101,39 @@ make clean && make all
 默认：`shm_name=/agsh1`，`writer_sock=/tmp/agora_writer.sock`，`reader_sock=/tmp/agora_reader.sock`，`payload_size=4096`。
 
 两端 **`shm_name` 与 `payload_size` 必须一致**；`reader_sock` 必须与写端第三个参数相同，写端才能 `sendto` 到读端已绑定的路径。
+
+### manager 示例 `agora_manager_demo`
+
+```text
+./build/agora_manager_demo <notify_write_bind> <notify_peer_recv> <write_shm_name>
+```
+
+| 参数 | 含义 |
+|------|------|
+| `notify_write_bind` | 本进程 **`notify_writer_init` 的 bind 路径**（写端本地 socket） |
+| `notify_peer_recv` | 每次 `write` 后 **`sendto` 的目标路径**（对端 **manager** 的接收路径） |
+| `write_shm_name` | 本进程 **`agora_shm_ipc_write` 使用的 POSIX SHM 名**（本端创建/附着写） |
+
+**约定**：本进程 **manager** 的 `notify_reader_init` 绑定路径为 **`<notify_write_bind>` + `".recv"`**（总长度须小于 `sockaddr_un.sun_path`）。对端应将其 **`notify_write_bind` + `".recv"`** 填进你这边的 **`notify_peer_recv`**。
+
+**双进程对称示例**（各自写自己的 SHM，对端 manager 根据通知头自动读）：
+
+终端 A：
+
+```bash
+./build/agora_manager_demo /tmp/am_a /tmp/am_b.recv /agsh_a
+```
+
+终端 B：
+
+```bash
+./build/agora_manager_demo /tmp/am_b /tmp/am_a.recv /agsh_b
+```
+
+- A：`writer` 绑 `/tmp/am_a`，`sendto` → `/tmp/am_b.recv`；manager 监听 **`/tmp/am_a.recv`**。  
+- B：`writer` 绑 `/tmp/am_b`，`sendto` → `/tmp/am_a.recv`；manager 监听 **`/tmp/am_b.recv`**。  
+
+`payload_size` 在 demo 内固定为 **4096**；退出用 **Ctrl+C**。异常退出后若路径残留，可手动 `unlink` 上述 `/tmp/am_*` 与 `shm_unlink` 各自 `write_shm_name`。
 
 ### 最小联调示例
 
