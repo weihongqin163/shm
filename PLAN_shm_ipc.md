@@ -8,7 +8,7 @@
 - **读不阻塞写**：写端从不等待读端；读慢时可能读到「不稳定」并重试（seqlock）。
 - **写入中 / 写完**：由 **seqlock 序列号奇偶** 表达；可选扩展独立 `state` 位（当前实现以 seq 为准）。
 - **崩溃恢复**：写进程每次启动在首次写前调用 `agora_shm_ipc_writer_session_begin`；读进程重启仅重新 `open` + 通知 socket，写进程可不重启。
-- **写完通知**：**`AF_UNIX` + `SOCK_DGRAM`**；**写端 bind** 到 `writer_bind_path`，**读端 bind** 到 `reader_recv_path`，写端提交共享内存后对 `reader_recv_path` **`sendto`** 短报文唤醒读端。
+- **写完通知**：**`AF_UNIX` + `SOCK_DGRAM`**；**写端 bind** 到 `writer_bind_path`，**读端 bind** 到 `reader_recv_path`，写端提交共享内存后对 `reader_recv_path` **`sendto`** **`AgoraShmIpcHeader`** 大小的快照唤醒读端。
 
 ## 与 shm_yuv 双槽方案的关系
 
@@ -54,7 +54,7 @@
 
 1. **读进程**：`agora_shm_ipc_notify_reader_init` → `socket` + **`bind(reader_recv_path)`**（必要时先 `unlink` 路径文件）。
 2. **写进程**：`agora_shm_ipc_notify_writer_init` → **`bind(writer_bind_path)`** + 记录对端 `reader_recv_path`。
-3. 每次 `agora_shm_ipc_write(..., meta, notify)` 成功提交共享内存后，向 **`reader_recv_path`** `sendto` 1 字节。
+3. 每次 `agora_shm_ipc_write(..., meta, notify)` 成功提交共享内存后，向 **`reader_recv_path`** `sendto` 一帧 **`AgoraShmIpcHeader`** 大小的快照（与映射区头布局一致），读端 `recv` 缓冲区至少为该大小。
 
 两端使用 **文件系统路径**（macOS 无 Linux abstract namespace）。路径长度受 `sockaddr_un.sun_path` 限制。
 

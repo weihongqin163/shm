@@ -19,10 +19,22 @@
 
 _Static_assert(sizeof(AgoraShmIpcHeader) <= 256, "header size bound");
 
+static void agora_shm_ipc_header_set_shm_name(AgoraShmIpcHeader *h,
+                                             const char *shm_name) {
+  if (h == NULL) {
+    return;
+  }
+  memset(h->shm_name, 0, sizeof(h->shm_name));
+  if (shm_name != NULL) {
+    (void)strncpy(h->shm_name, shm_name, sizeof(h->shm_name) - 1u);
+  }
+}
+
 static void agora_shm_ipc_header_apply_meta(AgoraShmIpcHeader *h,
                                            const AgoraShmIpcFrameMeta *meta) {
   if (meta != NULL) {
     memcpy(h->user_id, meta->user_id, sizeof(h->user_id));
+    memcpy(h->shm_name, meta->shm_name, sizeof(h->shm_name));
     h->media_type = meta->media_type;
     h->stream_type = meta->stream_type;
     h->width = meta->width;
@@ -45,6 +57,7 @@ static void agora_shm_ipc_header_apply_meta(AgoraShmIpcHeader *h,
 static void agora_shm_ipc_copy_meta_out(AgoraShmIpcFrameMeta *dst,
                                         const AgoraShmIpcHeader *h) {
   memcpy(dst->user_id, h->user_id, sizeof(dst->user_id));
+  memcpy(dst->shm_name, h->shm_name, sizeof(dst->shm_name));
   dst->media_type = h->media_type;
   dst->stream_type = h->stream_type;
   dst->width = h->width;
@@ -161,6 +174,8 @@ int agora_shm_ipc_open(const char *shm_name, size_t payload_size, int is_creator
     }
   }
 
+  agora_shm_ipc_header_set_shm_name(h, shm_name);
+
   out->region_base = p;
   out->header = h;
   out->payload = pl;
@@ -228,8 +243,7 @@ int agora_shm_ipc_write(AgoraShmIpc *ctx, const void *data, size_t len,
   (void)atomic_fetch_add_explicit(&h->seq, 1u, memory_order_release);
 
   if (notify != NULL && notify->fd >= 0 && notify->is_writer != 0) {
-    char b = 1;
-    (void)sendto(notify->fd, &b, 1, 0, (struct sockaddr *)&notify->peer,
+    (void)sendto(notify->fd, h, sizeof(*h), 0, (struct sockaddr *)&notify->peer,
                  notify->peer_len);
   }
   return 0;

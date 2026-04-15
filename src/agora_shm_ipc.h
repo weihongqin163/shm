@@ -14,6 +14,7 @@
 #include <sys/un.h>
 
 #define AGORA_SHM_IPC_USER_ID_BYTES 64u
+#define AGORA_SHM_IPC_SHM_NAME_BYTES 32u
 
 /** 0 = video, 1 = audio (stored as uint32_t in AgoraShmIpcHeader for stable layout). */
 typedef enum AgoraShmMediaType {
@@ -33,6 +34,8 @@ typedef enum AgoraShmStreamType {
  */
 typedef struct AgoraShmIpcFrameMeta {
   char user_id[AGORA_SHM_IPC_USER_ID_BYTES];
+  /** Same layout as header->shm_name; NUL-terminated, max 31 chars + '\0'. */
+  char shm_name[AGORA_SHM_IPC_SHM_NAME_BYTES];
   uint32_t media_type;   /**< AgoraShmMediaType */
   uint32_t stream_type;  /**< AgoraShmStreamType */
   int32_t width;
@@ -47,6 +50,8 @@ typedef struct AgoraShmIpcHeader {
   uint32_t version;
   uint32_t payload_size;
   uint32_t data_len;
+  /** POSIX shm object name used at open; NUL-terminated, max 31 chars + '\0'. */
+  char shm_name[AGORA_SHM_IPC_SHM_NAME_BYTES];
   char user_id[AGORA_SHM_IPC_USER_ID_BYTES];
   uint32_t media_type;   /**< AgoraShmMediaType */
   uint32_t stream_type;  /**< AgoraShmStreamType */
@@ -81,7 +86,8 @@ typedef struct AgoraShmIpcNotify {
  * Opens POSIX shared memory.
  *
  * @param shm_name      POSIX shm name (e.g. "/agsh1"); must start with '/' on
- *                      most systems; keep short on macOS.
+ *                      most systems; keep short on macOS. On success, copied
+ *                      into header->shm_name (truncated to fit).
  * @param payload_size  User payload bytes; total object size is
  *                      sizeof(AgoraShmIpcHeader) + payload_size.
  * @param is_creator    Non-zero: create with O_CREAT|O_EXCL, ftruncate, init
@@ -109,8 +115,9 @@ int agora_shm_ipc_writer_session_begin(AgoraShmIpc *ctx);
  *
  * @param meta   Frame metadata; copied into the header inside the seqlock. If
  *               NULL, metadata fields are cleared for this commit.
- * @param notify If non-NULL and initialized as writer, sends one byte to the
- *               reader socket after a successful SHM commit (best-effort).
+ * @param notify If non-NULL and initialized as writer, sends sizeof(header)
+ *               bytes (AgoraShmIpcHeader snapshot) to the reader socket after a
+ *               successful SHM commit (best-effort).
  */
 int agora_shm_ipc_write(AgoraShmIpc *ctx, const void *data, size_t len,
                         const AgoraShmIpcFrameMeta *meta,

@@ -98,6 +98,7 @@ int main(int argc, char **argv) {
     memset(&meta, 0, sizeof(meta));
     (void)strncpy(meta.user_id, "demo-writer-user-000000000000000000000000000000",
                   sizeof(meta.user_id) - 1u);
+    (void)strncpy(meta.shm_name, shm_name, sizeof(meta.shm_name) - 1u);
     meta.media_type = (uint32_t)AGORA_SHM_MEDIA_VIDEO;
     meta.stream_type = (uint32_t)AGORA_SHM_STREAM_MAIN;
     meta.width = 1280;
