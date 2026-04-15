@@ -29,8 +29,10 @@ make clean && make all
 | `build/agora_shm_ipc.o` | 库对象文件，可链进你的程序 |
 | `build/agora_writer_demo` | 写端示例 |
 | `build/agora_reader_demo` | 读端示例 |
+| `build/agora_manager_demo` | **manager** 示例：单进程监听 notify，按 `shm_name` 动态附着 SHM 并回调（见 [`PLAN_shm_ipc_manager.md`](PLAN_shm_ipc_manager.md)） |
+| `build/agora_shm_manager.o` | manager 层对象文件，与 `agora_shm_ipc.o`、`-pthread` 一起链接 |
 
-将 `src/agora_shm_ipc.c` 与你的源码一起编译，并保证 `-Isrc` 能包含 `agora_shm_ipc.h`。
+将 `src/agora_shm_ipc.c` 与你的源码一起编译，并保证 `-Isrc` 能包含 `agora_shm_ipc.h`。使用 manager 时需增加 `src/agora_shm_manager.c` 或 `build/agora_shm_manager.o`。
 
 ## 概念与约束
 
