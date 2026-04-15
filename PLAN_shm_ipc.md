@@ -23,10 +23,16 @@
 
 头字段（见 `src/agora_shm_ipc.h`）：
 
-- `magic` / `version`：格式校验。
+- `magic` / `version`：格式校验（当前 `version == 2` 含下列元数据布局）。
 - `payload_size`：创建时写入；附着方与入参比对。
 - `data_len`：当前逻辑长度（≤ `payload_size`），仅在 seqlock 写临界区内更新。
+- `user_id`：固定 64 字节（`AGORA_SHM_IPC_USER_ID_BYTES`），与 payload 同一 seqlock 提交。
+- `media_type` / `stream_type`：`uint32_t`，语义为枚举 `AgoraShmMediaType`（0 视频 / 1 音频）、`AgoraShmStreamType`（0 main / 1 slides）。
+- `width` / `height`：`int32_t`，视频帧尺寸（音频帧可置 0）。
+- `sample_rate` / `channels` / `bits`：`int32_t`，音频属性（视频帧可置 0）。
 - `seq`（`atomic_uint`）：**偶数** = 稳定态可读；**奇数** = 写入中。初始 `0`。
+
+写接口 `agora_shm_ipc_write(..., meta, notify)` 在 seqlock 内写入上述元数据与 payload；`meta == NULL` 时将该帧元数据清零。读接口 `agora_shm_ipc_read(..., out_meta)` 可在 `out_meta != NULL` 时取与稳定 payload 同一快照的元数据。
 
 ## seqlock 协议
 
@@ -48,7 +54,7 @@
 
 1. **读进程**：`agora_shm_ipc_notify_reader_init` → `socket` + **`bind(reader_recv_path)`**（必要时先 `unlink` 路径文件）。
 2. **写进程**：`agora_shm_ipc_notify_writer_init` → **`bind(writer_bind_path)`** + 记录对端 `reader_recv_path`。
-3. 每次 `agora_shm_ipc_write(..., notify)` 成功提交共享内存后，向 **`reader_recv_path`** `sendto` 1 字节。
+3. 每次 `agora_shm_ipc_write(..., meta, notify)` 成功提交共享内存后，向 **`reader_recv_path`** `sendto` 1 字节。
 
 两端使用 **文件系统路径**（macOS 无 Linux abstract namespace）。路径长度受 `sockaddr_un.sun_path` 限制。
 

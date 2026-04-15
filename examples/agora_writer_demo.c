@@ -1,5 +1,6 @@
 /**
- * author: Yan Zhennan
+ * created by:wei
+ * copyright (c) 2026 Agora IO. All rights reserved.
  * date: 2026-04-13
  */
 
@@ -51,6 +52,7 @@ int main(int argc, char **argv) {
     if (errno == EEXIST) {
       if (agora_shm_ipc_open(shm_name, payload_size, 0, &ctx) != 0) {
         perror("agora_shm_ipc_open attach");
+        (void)agora_shm_ipc_unlink(shm_name);
         return 1;
       }
     } else {
@@ -92,7 +94,19 @@ int main(int argc, char **argv) {
       send_len = 256u;
     }
 
-    if (agora_shm_ipc_write(&ctx, buf, send_len, &notify) != 0) {
+    AgoraShmIpcFrameMeta meta;
+    memset(&meta, 0, sizeof(meta));
+    (void)strncpy(meta.user_id, "demo-writer-user-000000000000000000000000000000",
+                  sizeof(meta.user_id) - 1u);
+    meta.media_type = (uint32_t)AGORA_SHM_MEDIA_VIDEO;
+    meta.stream_type = (uint32_t)AGORA_SHM_STREAM_MAIN;
+    meta.width = 1280;
+    meta.height = 720;
+    meta.sample_rate = 48000;
+    meta.channels = 2;
+    meta.bits = 16;
+
+    if (agora_shm_ipc_write(&ctx, buf, send_len, &meta, &notify) != 0) {
       perror("agora_shm_ipc_write");
       break;
     }

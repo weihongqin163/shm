@@ -1,5 +1,6 @@
 /**
- * author: Yan Zhennan
+ * created by:wei
+ * copyright (c) 2026 Agora IO. All rights reserved.
  * date: 2026-04-13
  */
 
@@ -12,11 +13,48 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+#define AGORA_SHM_IPC_USER_ID_BYTES 64u
+
+/** 0 = video, 1 = audio (stored as uint32_t in AgoraShmIpcHeader for stable layout). */
+typedef enum AgoraShmMediaType {
+  AGORA_SHM_MEDIA_VIDEO = 0,
+  AGORA_SHM_MEDIA_AUDIO = 1,
+} AgoraShmMediaType;
+
+/** 0 = main, 1 = slides (stored as uint32_t in AgoraShmIpcHeader). */
+typedef enum AgoraShmStreamType {
+  AGORA_SHM_STREAM_MAIN = 0,
+  AGORA_SHM_STREAM_SLIDES = 1,
+} AgoraShmStreamType;
+
+/**
+ * Per-frame metadata written with payload under the same seqlock.
+ * Integer fields use int32_t for fixed-width IPC layout (treat as int semantics).
+ */
+typedef struct AgoraShmIpcFrameMeta {
+  char user_id[AGORA_SHM_IPC_USER_ID_BYTES];
+  uint32_t media_type;   /**< AgoraShmMediaType */
+  uint32_t stream_type;  /**< AgoraShmStreamType */
+  int32_t width;
+  int32_t height;
+  int32_t sample_rate;
+  int32_t channels;
+  int32_t bits;
+} AgoraShmIpcFrameMeta;
+
 typedef struct AgoraShmIpcHeader {
   uint32_t magic;
   uint32_t version;
   uint32_t payload_size;
   uint32_t data_len;
+  char user_id[AGORA_SHM_IPC_USER_ID_BYTES];
+  uint32_t media_type;   /**< AgoraShmMediaType */
+  uint32_t stream_type;  /**< AgoraShmStreamType */
+  int32_t width;
+  int32_t height;
+  int32_t sample_rate;
+  int32_t channels;
+  int32_t bits;
   atomic_uint seq;
 } AgoraShmIpcHeader;
 
@@ -69,20 +107,26 @@ int agora_shm_ipc_writer_session_begin(AgoraShmIpc *ctx);
  * Writes payload under seqlock. Never blocks the reader's scheduling of writes;
  * the reader may observe EAGAIN if a stable snapshot was not available.
  *
+ * @param meta   Frame metadata; copied into the header inside the seqlock. If
+ *               NULL, metadata fields are cleared for this commit.
  * @param notify If non-NULL and initialized as writer, sends one byte to the
  *               reader socket after a successful SHM commit (best-effort).
  */
 int agora_shm_ipc_write(AgoraShmIpc *ctx, const void *data, size_t len,
+                        const AgoraShmIpcFrameMeta *meta,
                         const AgoraShmIpcNotify *notify);
 
 /**
  * Reads the latest stable payload into buf.
  *
+ * @param out_meta If non-NULL, filled with header metadata for the same stable
+ *                 snapshot as the payload (inside seqlock validation).
  * @return 0 on success, *out_len set. -1 with errno EAGAIN if no complete
  *         frame yet or concurrent write; ENOBUFS if cap < data_len; EINVAL /
  *         EIO for format issues.
  */
-int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len);
+int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len,
+                       AgoraShmIpcFrameMeta *out_meta);
 
 /** Writer: bind writer_bind_path; peer is reader_recv_path for sendto. */
 int agora_shm_ipc_notify_writer_init(AgoraShmIpcNotify *n,

@@ -1,5 +1,6 @@
 <!--
-  author: Yan Zhennan
+  created by:wei
+  copyright (c) 2026 Agora IO. All rights reserved.
   date: 2026-04-13
 -->
 

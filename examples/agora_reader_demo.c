@@ -1,5 +1,6 @@
 /**
- * author: Yan Zhennan
+ * created by:wei
+ * copyright (c) 2026 Agora IO. All rights reserved.
  * date: 2026-04-13
  */
 
@@ -96,14 +97,20 @@ int main(int argc, char **argv) {
     }
 
     size_t out_len = 0u;
-    if (agora_shm_ipc_read(&ctx, buf, payload_size, &out_len) != 0) {
+    AgoraShmIpcFrameMeta meta;
+    memset(&meta, 0, sizeof(meta));
+    if (agora_shm_ipc_read(&ctx, buf, payload_size, &out_len, &meta) != 0) {
       if (errno != EAGAIN) {
         perror("agora_shm_ipc_read");
       }
       continue;
     }
 
-    printf("reader seq=%u, frame=%u\n", ctx.header->seq, frame);
+    printf("reader seq=%u, frame=%u user_id=%.16s... media=%u stream=%u "
+           "wxh=%dx%d audio %d/%d/%d\n",
+           ctx.header->seq, frame, meta.user_id, meta.media_type,
+           meta.stream_type, (int)meta.width, (int)meta.height,
+           (int)meta.sample_rate, (int)meta.channels, (int)meta.bits);
     ++frame;
   }
 

@@ -1,5 +1,6 @@
 /**
- * author: Yan Zhennan
+ * created by:wei
+ * copyright (c) 2026 Agora IO. All rights reserved.
  * date: 2026-04-13
  */
 
@@ -14,9 +15,44 @@
 #include <unistd.h>
 
 #define AGORA_SHM_IPC_MAGIC 0xA601C0DEu
-#define AGORA_SHM_IPC_VER 1u
+#define AGORA_SHM_IPC_VER 2u
 
-_Static_assert(sizeof(AgoraShmIpcHeader) <= 64, "header size bound");
+_Static_assert(sizeof(AgoraShmIpcHeader) <= 256, "header size bound");
+
+static void agora_shm_ipc_header_apply_meta(AgoraShmIpcHeader *h,
+                                           const AgoraShmIpcFrameMeta *meta) {
+  if (meta != NULL) {
+    memcpy(h->user_id, meta->user_id, sizeof(h->user_id));
+    h->media_type = meta->media_type;
+    h->stream_type = meta->stream_type;
+    h->width = meta->width;
+    h->height = meta->height;
+    h->sample_rate = meta->sample_rate;
+    h->channels = meta->channels;
+    h->bits = meta->bits;
+  } else {
+    memset(h->user_id, 0, sizeof(h->user_id));
+    h->media_type = 0u;
+    h->stream_type = 0u;
+    h->width = 0;
+    h->height = 0;
+    h->sample_rate = 0;
+    h->channels = 0;
+    h->bits = 0;
+  }
+}
+
+static void agora_shm_ipc_copy_meta_out(AgoraShmIpcFrameMeta *dst,
+                                        const AgoraShmIpcHeader *h) {
+  memcpy(dst->user_id, h->user_id, sizeof(dst->user_id));
+  dst->media_type = h->media_type;
+  dst->stream_type = h->stream_type;
+  dst->width = h->width;
+  dst->height = h->height;
+  dst->sample_rate = h->sample_rate;
+  dst->channels = h->channels;
+  dst->bits = h->bits;
+}
 
 static size_t agora_shm_ipc_total_size(size_t payload_size) {
   return sizeof(AgoraShmIpcHeader) + payload_size;
@@ -166,11 +202,13 @@ int agora_shm_ipc_writer_session_begin(AgoraShmIpc *ctx) {
   }
   AgoraShmIpcHeader *h = ctx->header;
   h->data_len = 0u;
+  agora_shm_ipc_header_apply_meta(h, NULL);
   atomic_store_explicit(&h->seq, 0u, memory_order_release);
   return 0;
 }
 
 int agora_shm_ipc_write(AgoraShmIpc *ctx, const void *data, size_t len,
+                        const AgoraShmIpcFrameMeta *meta,
                         const AgoraShmIpcNotify *notify) {
   if (!ctx || !ctx->header || !ctx->payload || !data) {
     errno = EINVAL;
@@ -183,6 +221,7 @@ int agora_shm_ipc_write(AgoraShmIpc *ctx, const void *data, size_t len,
 
   AgoraShmIpcHeader *h = ctx->header;
   (void)atomic_fetch_add_explicit(&h->seq, 1u, memory_order_acq_rel);
+  agora_shm_ipc_header_apply_meta(h, meta);
   memcpy(ctx->payload, data, len);
   h->data_len = (uint32_t)len;
   atomic_thread_fence(memory_order_release);
@@ -196,7 +235,8 @@ int agora_shm_ipc_write(AgoraShmIpc *ctx, const void *data, size_t len,
   return 0;
 }
 
-int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len) {
+int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len,
+                       AgoraShmIpcFrameMeta *out_meta) {
   if (!ctx || !ctx->header || !ctx->payload || !buf || !out_len) {
     errno = EINVAL;
     return -1;
@@ -227,6 +267,9 @@ int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len)
     }
 
     memcpy(buf, ctx->payload, (size_t)len);
+    if (out_meta != NULL) {
+      agora_shm_ipc_copy_meta_out(out_meta, h);
+    }
 
     unsigned s2 =
         atomic_load_explicit(&h->seq, memory_order_acquire);
