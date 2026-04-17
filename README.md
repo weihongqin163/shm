@@ -6,7 +6,7 @@
 
 # agora_shm 用法说明
 
-本文说明仓库内 **POSIX 共享内存 IPC**（`agora_shm_ipc`）、**本机 UDP 信令**（`agora_localsock`）与 **组合层 manager**（`agora_shm_manager`）的编译、典型用法与示例参数。写读双进程示例仍可使用 **Unix 域 `agora_shm_ipc_notify`**；**manager 路径已改为 localsocket**，不再依赖 notify。
+本文说明仓库内 **POSIX 共享内存 IPC**（`agora_shm_ipc`）、**本机 UDP 信令**（`agora_localsock`）与 **组合层 manager**（`agora_shm_manager`）的编译、典型用法与示例参数。**写读双进程示例**仅依赖 **`agora_shm_ipc`**（读端短间隔轮询 `agora_shm_ipc_read`）；**manager** 路径用 **localsocket** 做信令与唤醒。
 
 ## 依赖与平台
 
@@ -27,10 +27,9 @@ make clean && make all
 | 产物 | 说明 |
 |------|------|
 | `build/agora_shm_ipc.o` | SHM + seqlock 核心对象 |
-| `build/agora_shm_ipc_notify.o` | Unix 域通知（**writer/reader demo 使用**） |
 | `build/agora_localsock.o` | 127.0.0.1 UDP localsocket |
-| `build/agora_shm_manager.o` | manager 组合层（链 `agora_shm_ipc.o` + `agora_localsock.o` + `-pthread`，**不**链 `agora_shm_ipc_notify.o`） |
-| `build/agora_writer_demo` / `build/agora_reader_demo` | 基于 **notify** 的写/读示例 |
+| `build/agora_shm_manager.o` | manager 组合层（链 `agora_shm_ipc.o` + `agora_localsock.o` + `-pthread`） |
+| `build/agora_writer_demo` / `build/agora_reader_demo` | 仅 **SHM** 的写/读示例（读端轮询，无独立 notify 模块） |
 | `build/agora_manager_demo` | **localsocket + manager**：端口、`server_mode`、localsock 参数、写 SHM 名（见下文） |
 | `build/agora_localsock_demo` | localsocket 最小 server/client 示例 |
 
@@ -48,31 +47,28 @@ make clean && make all
 - **单槽**：一块连续区 = 固定 **header** + 你指定的 **payload**；总大小为 `sizeof(AgoraShmIpcHeader) + payload_size`。
 - **一致性**：payload 经 **seqlock**（`header.seq` 奇偶）保护；读端可能 **`errno == EAGAIN`**，应重试。
 
-### 与 Unix notify 一起用（writer/reader demo）
+### writer/reader demo（轮询读）
 
-- **通知**：`AF_UNIX` + `SOCK_DGRAM`（**`agora_shm_ipc_notify.h`**）。写端 **`bind(writer_bind_path)`**，在 **`agora_shm_ipc_write` 成功后** 调用 **`agora_shm_ipc_notify_post_write`** **`sendto`** 到读端路径；读端 **`bind(reader_recv_path)`**，`poll`/`recv` 等待。
-- **推荐顺序**：读进程先 **`notify_reader_init`** 再附着 SHM；写进程 **`open` + `writer_session_begin` + `notify_writer_init`**，循环 **`write` + `notify_post_write`**。详见下文「写端/读端流程」与 **reader/writer demo** 小节。
+- 写端只调用 **`agora_shm_ipc_write`**；读端在短 **`usleep`** 间隔下重试 **`agora_shm_ipc_read`**，并用 **`header->seq`** 去重，避免同一稳定帧重复打印。生产环境可用 **localsocket APP 整头**（与 manager 一致）替代忙等。
 
 ## 概念与约束（manager 场景）
 
-- **APP UDP**：`msg_type == 2`，payload 为 **`sizeof(AgoraShmIpcHeader)`** 的裸头（与旧 notify 头快照语义一致）。
+- **APP UDP**：`msg_type == 2`，payload 为 **`sizeof(AgoraShmIpcHeader)`** 的裸头（用于携带头快照以便对端附着/读 SHM）。
 - **WRITECMD**：`msg_type == 3`，payload 为 **`AgoraShmIpcFrameMeta`**；对端若无读表项，会 **probe** SHM 头得到 **`payload_size`** 再附着读。
 - **meta 生命周期**：`on_frame` 里的 **`AgoraShmIpcFrameMeta *`** 仅在回调返回前有效。
 
-## 写端流程（API，notify 路径）
+## 写端流程（API，仅 SHM）
 
 1. `agora_shm_ipc_open(shm_name, payload_size, /*is_creator=*/1, &ctx)`；若 `EEXIST` 可改为 `is_creator=0` 附着。
 2. `agora_shm_ipc_writer_session_begin(&ctx)`。
-3. `agora_shm_ipc_notify_writer_init(&notify, writer_sock, reader_sock)`。
-4. 循环：`agora_shm_ipc_write` 成功后 `agora_shm_ipc_notify_post_write`；`len <= payload_size`。
-5. 退出：`notify_fini`、`agora_shm_ipc_close`；必要时 **`agora_shm_ipc_unlink(shm_name)`**。
+3. 循环：`agora_shm_ipc_write`；`len <= payload_size`。
+4. 退出：`agora_shm_ipc_close`；必要时 **`agora_shm_ipc_unlink(shm_name)`**。
 
-## 读端流程（API，notify 路径）
+## 读端流程（API，仅 SHM）
 
-1. `agora_shm_ipc_notify_reader_init`；用 **`notify_fd`** `poll` / `recv`。
-2. `agora_shm_ipc_open(shm_name, payload_size, 0, &ctx)`（`payload_size` 须与对象一致）。
-3. `agora_shm_ipc_read`；`EAGAIN` 可重试。
-4. 退出：`close`、`notify_fini`。
+1. `agora_shm_ipc_open(shm_name, payload_size, 0, &ctx)`（`payload_size` 须与对象一致）。
+2. `agora_shm_ipc_read`；`EAGAIN` 时重试（可与 **`usleep` / `poll`** 或 **localsocket** 结合）。
+3. 退出：`agora_shm_ipc_close`。
 
 ## 错误与 `errno`（`agora_shm_ipc` 摘要）
 
@@ -89,20 +85,20 @@ make clean && make all
 ### 读端 `agora_reader_demo`
 
 ```text
-./build/agora_reader_demo [shm_name [reader_sock [payload_size]]]
+./build/agora_reader_demo [shm_name [payload_size]]
 ```
 
-默认：`shm_name=/agsh1`，`reader_sock=/tmp/agora_reader.sock`，`payload_size=4096`。
+默认：`shm_name=/agsh1`，`payload_size=4096`。
 
 ### 写端 `agora_writer_demo`
 
 ```text
-./build/agora_writer_demo [shm_name [writer_sock [reader_sock [payload_size]]]]
+./build/agora_writer_demo [shm_name [payload_size]]
 ```
 
-默认：`shm_name=/agsh1`，`writer_sock=/tmp/agora_writer.sock`，`reader_sock=/tmp/agora_reader.sock`，`payload_size=4096`。
+默认：`shm_name=/agsh1`，`payload_size=4096`。
 
-两端 **`shm_name` 与 `payload_size` 必须一致**；`reader_sock` 须与写端第三个参数相同。
+两端 **`shm_name` 与 `payload_size` 必须一致**。
 
 ### manager 示例 `agora_manager_demo`（localsocket）
 
@@ -126,7 +122,7 @@ make clean && make all
 ./build/agora_localsock_demo client <port> <keepalive_ms> [seconds]
 ```
 
-### 最小联调（notify reader / writer）
+### 最小联调（reader / writer）
 
 终端 A：
 
@@ -143,7 +139,6 @@ make clean && make all
 ## 清理与调试
 
 - **POSIX 共享内存**：调试可 **`agora_shm_ipc_unlink("/agsh1")`**（名称与运行时一致）。
-- **Unix socket 路径**（notify）：`notify_fini` 会 `unlink` 本进程 `bind` 过的路径；异常退出可手动删 `/tmp/agora_reader.sock` 等。
 - **macOS**：`shm_open` 名称尽量短；示例 `/agsh1` 较短。
 
 ## 进一步设计说明

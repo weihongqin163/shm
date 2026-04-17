@@ -101,8 +101,8 @@ int agora_shm_ipc_writer_session_begin(AgoraShmIpc *ctx);
 /**
  * Writes payload under seqlock. Never blocks the reader's scheduling of writes;
  * the reader may observe EAGAIN if a stable snapshot was not available.
- * Does not perform Unix notify sendto; the upper layer should call
- * agora_shm_ipc_notify_post_write (see agora_shm_ipc_notify.h) after success.
+ * Does not wake the reader. Use an out-of-band channel (e.g. localsocket APP
+ * datagram carrying a full header snapshot) or polling where appropriate.
  *
  * @param meta   Frame metadata; copied into the header inside the seqlock. If
  *               NULL, metadata fields are cleared for this commit.

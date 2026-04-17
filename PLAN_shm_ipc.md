@@ -7,15 +7,15 @@
 - 创建/打开时可指定 **payload 字节数**；对象总长度 = **固定头 + payload**。
 - **读不阻塞写**：写端从不等待读端；读慢时可能读到「不稳定」并重试（seqlock）。
 - **写入中 / 写完**：由 **seqlock 序列号奇偶** 表达；可选扩展独立 `state` 位（当前实现以 seq 为准）。
-- **崩溃恢复**：写进程每次启动在首次写前调用 `agora_shm_ipc_writer_session_begin`；读进程重启仅重新 `open` + 通知 socket，写进程可不重启。
-- **写完通知**：**`AF_UNIX` + `SOCK_DGRAM`**；**写端 bind** 到 `writer_bind_path`，**读端 bind** 到 `reader_recv_path`，写端提交共享内存后对 `reader_recv_path` **`sendto`** **`AgoraShmIpcHeader`** 大小的快照唤醒读端。
+- **崩溃恢复**：写进程每次启动在首次写前调用 `agora_shm_ipc_writer_session_begin`；读进程重启仅重新 `open`，写进程可不重启。
+- **写完唤醒**：不在本模块内实现；由上层使用 **localsocket APP 整头**、其他 IPC，或读端 **轮询** `agora_shm_ipc_read`（示例见 `agora_reader_demo`）。
 
 ## 与 shm_yuv 双槽方案的关系
 
 | 项目 | shm_yuv | agora_shm_ipc |
 |------|---------|---------------|
 | 数据 | 固定 YUV 布局 + 双槽 | 通用 payload + **单槽 seqlock** |
-| 唤醒 | 无（示例轮询） | **Unix 域 UDP** |
+| 唤醒 | 无（示例轮询） | **上层自选**（如 localsocket；仓库已移除独立 Unix notify 模块） |
 
 ## 内存布局
 
@@ -32,7 +32,7 @@
 - `sample_rate` / `channels` / `bits`：`int32_t`，音频属性（视频帧可置 0）。
 - `seq`（`atomic_uint`）：**偶数** = 稳定态可读；**奇数** = 写入中。初始 `0`。
 
-写接口 `agora_shm_ipc_write(..., meta)` 在 seqlock 内写入上述元数据与 payload；`meta == NULL` 时将该帧元数据清零；**不**包含 Unix notify。上层在写成功后调用 **`agora_shm_ipc_notify_post_write`**（`agora_shm_ipc_notify.h`）对读端 `sendto` 整头快照。读接口 `agora_shm_ipc_read(..., out_meta)` 可在 `out_meta != NULL` 时取与稳定 payload 同一快照的元数据。
+写接口 `agora_shm_ipc_write(..., meta)` 在 seqlock 内写入上述元数据与 payload；`meta == NULL` 时将该帧元数据清零；**不**包含任何套接字发送。读接口 `agora_shm_ipc_read(..., out_meta)` 可在 `out_meta != NULL` 时取与稳定 payload 同一快照的元数据。
 
 ## seqlock 协议
 
@@ -50,20 +50,11 @@
 
 **`agora_shm_ipc_writer_session_begin`**：将 `seq` 置 `0`、`data_len` 置 `0`（`release`），清除上进程残留「卡在奇数」或脏长度。
 
-## Unix 域 UDP 通知拓扑
-
-1. **读进程**：`agora_shm_ipc_notify_reader_init` → `socket` + **`bind(reader_recv_path)`**（必要时先 `unlink` 路径文件）。
-2. **写进程**：`agora_shm_ipc_notify_writer_init` → **`bind(writer_bind_path)`** + 记录对端 `reader_recv_path`。
-3. 每次 `agora_shm_ipc_write(..., meta)` 成功提交共享内存后，由上层调用 **`agora_shm_ipc_notify_post_write`**，向 **`reader_recv_path`** `sendto` 一帧 **`AgoraShmIpcHeader`** 大小的快照（与映射区头布局一致），读端 `recv` 缓冲区至少为该大小。
-
-两端使用 **文件系统路径**（macOS 无 Linux abstract namespace）。路径长度受 `sockaddr_un.sun_path` 限制。
-
 ## 公开 API 摘要
 
 - `agora_shm_ipc_open` / `agora_shm_ipc_close` / `agora_shm_ipc_unlink`
 - `agora_shm_ipc_writer_session_begin`
 - `agora_shm_ipc_write` / `agora_shm_ipc_read`
-- `agora_shm_ipc_notify_*`（`agora_shm_ipc_notify.h` / `agora_shm_ipc_notify.c`）：`notify_writer_init` / `notify_reader_init` / `notify_fd` / `notify_fini` / **`notify_post_write`**
 
 错误：以 **`-1` + `errno`** 为主；无稳定帧可读时 **`errno=EAGAIN`**。
 
@@ -81,5 +72,4 @@
 ## 源码位置
 
 - SHM 头文件 / 实现：[src/agora_shm_ipc.h](src/agora_shm_ipc.h)、[src/agora_shm_ipc.c](src/agora_shm_ipc.c)
-- Notify 头文件 / 实现：[src/agora_shm_ipc_notify.h](src/agora_shm_ipc_notify.h)、[src/agora_shm_ipc_notify.c](src/agora_shm_ipc_notify.c)
 - 示例：[examples/agora_writer_demo.c](examples/agora_writer_demo.c)、[examples/agora_reader_demo.c](examples/agora_reader_demo.c)

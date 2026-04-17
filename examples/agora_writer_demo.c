@@ -5,7 +5,6 @@
  */
 
 #include "agora_shm_ipc.h"
-#include "agora_shm_ipc_notify.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -25,21 +24,13 @@ int main(int argc, char **argv) {
   (void)setvbuf(stdout, NULL, _IOLBF, 0);
 
   const char *shm_name = "/agsh1";
-  const char *writer_sock = "/tmp/agora_writer.sock";
-  const char *reader_sock = "/tmp/agora_reader.sock";
   size_t payload_size = 4096u;
 
   if (argc >= 2) {
     shm_name = argv[1];
   }
   if (argc >= 3) {
-    writer_sock = argv[2];
-  }
-  if (argc >= 4) {
-    reader_sock = argv[3];
-  }
-  if (argc >= 5) {
-    payload_size = (size_t)strtoul(argv[4], NULL, 10);
+    payload_size = (size_t)strtoul(argv[2], NULL, 10);
     if (payload_size == 0u) {
       fprintf(stderr, "payload_size must be > 0\n");
       return 1;
@@ -68,18 +59,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  AgoraShmIpcNotify notify;
-  memset(&notify, 0, sizeof(notify));
-  if (agora_shm_ipc_notify_writer_init(&notify, writer_sock, reader_sock) !=
-      0) {
-    perror("agora_shm_ipc_notify_writer_init");
-    agora_shm_ipc_close(&ctx);
-    return 1;
-  }
   uint8_t *buf = (uint8_t *)malloc(payload_size);
   if (!buf) {
     fprintf(stderr, "malloc failed\n");
-    agora_shm_ipc_notify_fini(&notify);
     agora_shm_ipc_close(&ctx);
     return 1;
   }
@@ -111,19 +93,14 @@ int main(int argc, char **argv) {
       perror("agora_shm_ipc_write");
       break;
     }
-    if (agora_shm_ipc_notify_post_write(&ctx, &notify) != 0) {
-      perror("agora_shm_ipc_notify_post_write");
-      break;
-    }
     printf("writer seq=%u, frame=%u\n", ctx.header->seq, seq);
-  
+
     ++seq;
 
     sleep_ms(330);
   }
 
   free(buf);
-  agora_shm_ipc_notify_fini(&notify);
   agora_shm_ipc_close(&ctx);
   return 0;
 }

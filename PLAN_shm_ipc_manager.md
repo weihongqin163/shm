@@ -5,7 +5,7 @@
 ## 一、总体规范
 
 1. **组合层**：`agora_shm_manager` 是对 **[`agora_shm_ipc`](src/agora_shm_ipc.h)**（POSIX SHM + seqlock）与 **[`agora_localsock`](src/agora_localsock.h)**（127.0.0.1 UDP）的 **组合编排层**，对外暴露 **`AgoraShmManager`** 与 `agora_shm_manager_*` API。
-2. **不使用 notify**：manager **不得**调用 **`agora_shm_ipc_notify_*`**；信令与唤醒走 **localsocket**（见 [`PLAN_localsocket.md`](PLAN_localsocket.md)）。
+2. **信令与唤醒**：manager 仅通过 **localsocket**（见 [`PLAN_localsocket.md`](PLAN_localsocket.md)）；仓库已移除 **`agora_shm_ipc_notify`** 模块。
 3. **类型隐藏（定稿修订）**：公开头文件中 **不出现** `AgoraShmIpc`、`AgoraShmIpcNotify` 指针及 **`agora_localsock_*` 符号**。为与 SHM 元数据 **定义完全一致**，**`on_frame` 使用 [`AgoraShmIpcFrameMeta`](src/agora_shm_ipc.h)**（manager.h **`#include "agora_shm_ipc.h"`** 仅用于该类型及必要常量；**不得**在公开 API 中暴露 `AgoraShmIpc *` 等句柄）。`AgoraShmIpc` / `agora_localsock_*` **仅**出现在 **manager.c** 内部。
 4. **纯 C**：`pthread`；**`bool`** 使用 `<stdbool.h>`。
 
@@ -90,7 +90,7 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
 
 ### 3.5 APP 报文 payload 格式（定稿）
 
-- **`msg_type == AGORA_LOCALSOCK_MSG_APP`（2）** 时，**payload 主体**为 **`AgoraShmIpcHeader` 的整头裸字节**，长度为 **`sizeof(AgoraShmIpcHeader)`**，语义与旧 **`agora_shm_ipc_notify_post_write` / Unix notify** 发送的头快照 **一致**，便于从中读取 `shm_name`、`payload_size`、`magic`/`version` 等并 **`agora_shm_ipc_open` / `agora_shm_ipc_read`**。
+- **`msg_type == AGORA_LOCALSOCK_MSG_APP`（2）** 时，**payload 主体**为 **`AgoraShmIpcHeader` 的整头裸字节**，长度为 **`sizeof(AgoraShmIpcHeader)`**，便于从中读取 `shm_name`、`payload_size`、`magic`/`version` 等并 **`agora_shm_ipc_open` / `agora_shm_ipc_read`**。
 - UDP 报文布局：**12 字节 `agora_localsock_header`** + **`payload_len` 字节**，其中上述情况 **`payload_len == sizeof(AgoraShmIpcHeader)`** 且内容为一帧头镜像。
 
 ### 3.6 `agora_shm_manager_add` / `agora_shm_manager_remove`
@@ -109,7 +109,7 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
 
 | 项目 | 旧版 | 新版 |
 |------|------|------|
-| 信令 | Unix `notify` | localsocket UDP |
+| 信令 | （已移除独立 notify 模块） | localsocket UDP |
 | demo | 三参数 Unix 路径 | **仅** port + server_mode + localsock 参数（不并存） |
 | `add`/`remove` | 有逻辑 | **读写分表** + `add(max_payload_size)` / `remove` 按名 |
 
@@ -120,7 +120,7 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
 
 ## 六、依赖与构建
 
-- 链接：**`agora_shm_ipc.o`** + **`agora_localsock.o`** + **`pthread`**；**不要** `agora_shm_ipc_notify.o`（manager 不链接 notify）。
+- 链接：**`agora_shm_ipc.o`** + **`agora_localsock.o`** + **`pthread`**。
 
 ## 七、图示
 
