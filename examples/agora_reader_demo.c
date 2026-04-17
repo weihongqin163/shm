@@ -1,10 +1,11 @@
 /**
  * created by:wei
  * copyright (c) 2026 Agora IO. All rights reserved.
- * date: 2026-04-13
+ * date: 2026-04-15
  */
 
 #include "agora_shm_ipc.h"
+#include "agora_shm_ipc_notify.h"
 
 #include <errno.h>
 #include <poll.h>

@@ -1,128 +1,150 @@
-# agora_shm_manager 规划（上层管理）
+# agora_shm_manager 规划（组合层：SHM IPC + localsocket）
 
-## 目标
+本文档为 **重设计** 版本，取代原先「Unix notify + manager 表」为主线的描述。实现语言：**纯 C**（C11）。**与旧版实现不并存**：落地时以本 PLAN 为准 **替换** [`agora_shm_manager.h`](src/agora_shm_manager.h) / [`agora_shm_manager.c`](src/agora_shm_manager.c) 与 **`agora_manager_demo`** 等依赖路径，不再保留「Unix notify + 三参数 demo」并存形态。
 
-在 **[`src/agora_shm_ipc.h`](src/agora_shm_ipc.h) / [`src/agora_shm_ipc.c`](src/agora_shm_ipc.c)** 之上增加 **manager** 层：单进程 **一个 manager、一个读端 notify、N 个写 IPC、M 个读 IPC**；以 **`shm_name` 字符串** 作为表内唯一键，负责多路 SHM 的登记、监听通知、按需 `open` 读端并 `read`、以及生命周期收尾。
+## 一、总体规范
 
-对外命名统一为 **`agora_shm_manager_xx`**（类型如 `AgoraShmManager`，函数如 `agora_shm_manager_start`）。
+1. **组合层**：`agora_shm_manager` 是对 **[`agora_shm_ipc`](src/agora_shm_ipc.h)**（POSIX SHM + seqlock）与 **[`agora_localsock`](src/agora_localsock.h)**（127.0.0.1 UDP）的 **组合编排层**，对外暴露 **`AgoraShmManager`** 与 `agora_shm_manager_*` API。
+2. **不使用 notify**：manager **不得**调用 **`agora_shm_ipc_notify_*`**；信令与唤醒走 **localsocket**（见 [`PLAN_localsocket.md`](PLAN_localsocket.md)）。
+3. **类型隐藏（定稿修订）**：公开头文件中 **不出现** `AgoraShmIpc`、`AgoraShmIpcNotify` 指针及 **`agora_localsock_*` 符号**。为与 SHM 元数据 **定义完全一致**，**`on_frame` 使用 [`AgoraShmIpcFrameMeta`](src/agora_shm_ipc.h)**（manager.h **`#include "agora_shm_ipc.h"`** 仅用于该类型及必要常量；**不得**在公开 API 中暴露 `AgoraShmIpc *` 等句柄）。`AgoraShmIpc` / `agora_localsock_*` **仅**出现在 **manager.c** 内部。
+4. **纯 C**：`pthread`；**`bool`** 使用 `<stdbool.h>`。
 
-## 已确认决策（与评审问答一致）
-
-**问卷对应：1A / 2A / 3A / 4C / 5A。**
-
-1. **帧交付**：采用 **注册回调**。工作线程在 `agora_shm_ipc_read` 成功后调用业务注册的 `on_frame`（签名在下方 API 草拟中约定）；**回调内不得再调用会阻塞或长时间持 manager 锁的 API**（实现上应在 **释放表锁之后** 再调回调，避免死锁）。
-2. **写端 notify**：**由业务进程创建并持有** `AgoraShmIpcNotify`（`agora_shm_ipc_notify_writer_init`）；manager **只**创建并持有 **读端** `notify_reader_init`。业务须保证所有写端的 **`reader_recv_path` 与 manager 绑定的路径一致**，否则 manager 收不到 `sendto`。
-3. **表结构**：**固定最多 64 槽位** 的数组 + **线性查找** `shm_name`（实现简单；满表时 `add` / 自动建读失败返回 `ENOMEM` 或约定错误码）。
-4. **`open(attach)` 遇 `ENOENT`**：**不重试**，**丢弃该次通知**；依赖后续写端再次 `write`+`notify` 或业务先 **`agora_shm_manager_add` 写端** / 先创建 SHM 后再通知。
-5. **表项移除**：**仅**通过 **`agora_shm_manager_remove(shm_name)`** 显式移除并 `agora_shm_ipc_close`；不做 TTL 自动淘汰（若将来需要，另开扩展章节）。
-
-## 与下层的关系
-
-- 下层协议不变：seqlock、整头 `sendto` 唤醒、[`AgoraShmIpcHeader`](src/agora_shm_ipc.h) 中含 `shm_name`、`payload_size` 等（见 [`PLAN_shm_ipc.md`](PLAN_shm_ipc.md)）。
-- manager **不修改** seqlock 语义，只 **编排** 多个 `AgoraShmIpc` 与 **一个** 读端 notify fd。
-
-```mermaid
-flowchart TB
-  subgraph proc [Single process]
-    M[AgoraShmManager]
-    N[notify_reader_init one fd]
-    T[Worker thread]
-    Tbl[Table max 64 entries]
-  end
-  M --> N
-  M --> T
-  T --> Tbl
-  T -->|"recv header parse shm_name"| Tbl
-  extWriters[External writer notifies sendto]
-  extWriters --> N
-```
-
-## 生命周期
-
-### `agora_shm_manager_start`
-
-- 入参建议包含：`reader_recv_path`（与所有写端 notify 的 peer 路径一致）、**`on_frame` 回调** + **`user` 指针**、可选 **默认 `payload_size` 上限**（若通知头与表项冲突时的策略见下节）。
-- 初始化 **64 槽** 表（全空）、互斥锁、线程停止标志（`atomic` 或 `volatile` + `pthread_join`）。
-- 调用 **`agora_shm_ipc_notify_reader_init`** 绑定 `reader_recv_path`。
-- 启动 **一个** 工作线程：对 notify fd **`poll` / `recv`**，`recv` 缓冲 **`alignas(AgoraShmIpcHeader) unsigned char buf[sizeof(AgoraShmIpcHeader)]`**；将 `buf` **转换为** `const AgoraShmIpcHeader *` 解析 `shm_name`、`payload_size`、`magic`/`version`（非法则丢弃）。
-- **表中无此 `shm_name`**：调用 **`agora_shm_ipc_open(shm_name, payload_size, 0, &ctx)`**。若返回 **`ENOENT`**：**直接丢弃本包，不重试**。若成功：插入表（标记为读侧自动创建或 `role=read`）。
-- **表中已有**：取出对应 `AgoraShmIpc *`，调用 **`agora_shm_ipc_read`**；成功则 **释锁后** 调 **`on_frame(shm_name, payload, len, meta, user)`**。
-- 写侧表项：一般由 **`agora_shm_manager_add`** 预先登记（见下）；线程路径主要处理 **读** 与 **动态发现读**。
-
-### `agora_shm_manager_close`
-
-- 置停止标志；**join** 工作线程。
-- 遍历表：对每个非空项 **`agora_shm_ipc_close`**。
-- **`agora_shm_ipc_notify_fini`** 读端 notify。
-- 清空状态（或要求调用方不再使用 `AgoraShmManager` 指针）。
-
-## `agora_shm_manager_add` / `agora_shm_manager_remove`
-
-- **`add`**：入参包含 **`shm_name`**、**角色**（读 / 写，可用 `enum`）、已 **`agora_shm_ipc_open` 成功** 的 `AgoraShmIpc`（或由 PLAN 约定 manager 内代为 `open`，首版可要求调用方已 open 以减少职责）；在表中找空槽或同键更新策略（**同键已存在则返回 `EEXIST` 或先 remove 再 add** 需在实现中写死一种）。
-- **`remove`**：按 `shm_name` 查找，**`agora_shm_ipc_close`** 并从表删除；与线程 **共用互斥锁**。
-
-## 回调类型（草拟）
+## 二、对外 API（目标签名）
 
 ```c
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "agora_shm_ipc.h"   /* for AgoraShmIpcFrameMeta only in public callback */
+
+typedef struct AgoraShmManager AgoraShmManager;
+
 typedef void (*agora_shm_manager_on_frame_fn)(
     const char *shm_name,
     const void *payload,
     size_t len,
     const AgoraShmIpcFrameMeta *meta,
     void *user);
+
+/**
+ * port: UDP 端口（127.0.0.1），必须 > 0；port==0 非法，返回 -1 且 errno=EINVAL。
+ * server_mode: true=localsocket server bind port；false=client connect 127.0.0.1:port。
+ * localsock_max_clients: 仅 server 模式传入 `agora_localsock_server_create` 的 max_clients；client 模式可忽略（实现传占位或忽略）。
+ * localsock_keepalive_ms: 传入 server 的 keepalive_interval_ms（5× 超时）；与 client 侧线程内 500ms keepalive **独立**（见 3.2）。
+ * max_payload_size: 工作线程读 SHM 等上限（0=实现内默认）。
+ */
+int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
+                            uint16_t port,
+                            bool server_mode,
+                            size_t localsock_max_clients,
+                            uint32_t localsock_keepalive_ms,
+                            void *user,
+                            size_t max_payload_size,
+                            AgoraShmManager **out);
+
+void agora_shm_manager_close(AgoraShmManager *m);
+
+/** 写表登记：`agora_shm_ipc_open(..., is_creator=1)` + `writer_session_begin`。
+ *  max_payload_size 即 IPC payload_size，须非零（EINVAL）。写表/读表各最多 64 条；
+ *  若 shm_name 已在写表或读（自动附着）表：EEXIST。表满：ENOMEM。 */
+int agora_shm_manager_add(AgoraShmManager *m, const char *shm_name,
+                          size_t max_payload_size);
+
+/** 先写表按名移除并 close；否则读表；皆无则 ENOENT。 */
+int agora_shm_manager_remove(AgoraShmManager *m, const char *shm_name);
+
+/** 写表项上 `agora_shm_ipc_write`，再发 localsock WRITECMD（头 + `AgoraShmIpcFrameMeta`）。 */
+int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
+                            const void *data, size_t len,
+                            const AgoraShmIpcFrameMeta *meta);
 ```
 
-- `payload` / `meta` 生命周期：实现可提供 **线程局部缓冲** 或 **在回调返回前有效**（PLAN 推荐 **回调返回即失效**，业务若需异步应自行拷贝）。
+### 回调与 `meta` 生命周期（定稿）
 
-## 并发与锁
+- **`meta` 指针**指向与当前帧一致的 **`AgoraShmIpcFrameMeta`** 数据；**仅在 `on_frame` 回调返回前有效**，返回后实现可复用或释放内部缓冲，**业务不得持有裸指针跨异步**。
 
-- **一张互斥锁**保护：64 槽表、`stop` 标志相关的状态迁移。
-- **禁止**在持锁时调用用户回调；**禁止**在回调里调用 `manager_remove` 同线程可重入导致死锁的路径——若必须支持，实现可用 **“待删除队列”** 在锁外处理（首版可在 PLAN 中标为 TODO）。
+## 三、实现逻辑
 
-## 边界与错误策略
+### 3.1 `port` 与校验
 
-- **`payload_size` 与已打开表项不一致**：首版策略建议 **拒绝更新并打日志** 或 **close 再按通知重开**（二选一写进实现注释）。
-- **表满（64）**：`add` 或自动插入读失败，返回明确错误。
-- **通知长度不足 `sizeof(AgoraShmIpcHeader)`**：丢弃。
+- **`port == 0` 或 `port` 表示非法 UDP 端口**：**`agora_shm_manager_start` 失败**，`errno = EINVAL`。
+- **`server_mode == true`**：`agora_localsock_server_create(port, localsock_keepalive_ms, localsock_max_clients, ...)`。
+- **`server_mode == false`**：`agora_localsock_client_create(port, ...)`（connect 到 `port`）。
 
-## 源码与构建（已实现首版）
+### 3.2 工作线程与 client keep-alive（定稿）
 
-| 路径 | 说明 |
-|------|------|
-| [`src/agora_shm_manager.h`](src/agora_shm_manager.h) | `AgoraShmManager`、`agora_shm_manager_start` / `_close` / `_add` / `_remove`、回调类型 |
-| [`src/agora_shm_manager.c`](src/agora_shm_manager.c) | 64 槽表、线程主循环、`pthread` |
-| [`Makefile`](Makefile) | `build/agora_shm_manager.o` 纳入 `make all`；链接增加 `-pthread` |
+- **一条** worker `pthread`。
+- **Server 模式**：循环调用 **`agora_localsock_server_poll`**（带超时），收到数据后进入 **`onIPCSignal`** 链路（见 3.4）。
+- **Client 模式**：循环 **`agora_localsock_client_poll`**（见 [`PLAN_localsocket.md`](PLAN_localsocket.md) 新增 API）+ 定时逻辑：除 poll 外，**每 500ms** 调用一次 **`agora_localsock_client_send_keepalive`**（由 manager 线程承担，**不**要求业务再驱动；与「独立使用 localsock 客户端时由业务发 keepalive」可并存——见 localsock PLAN 备注）。
+- **`localsock_keepalive_ms`**：仅用于 **server** 侧 peer 超时（`5×`）；**不**作为上述 500ms 的来源。
 
-业务可：`cc ... build/agora_shm_ipc.o build/agora_shm_manager.o -pthread`（Linux 另加 `-lrt`）。
+### 3.3 `onIPCSignal`（实现内 static，不进头文件）
 
-## 示例 `agora_manager_demo`（用法与设计约定）
+- 收到一帧 **localsocket UDP 负载** 后调用 `onIPCSignal(recv_buffer, recv_len)`。
+- **首版**：可仍为 **空实现**；后续解析 **`agora_localsock_header` + `msg_type==APP` 的 payload**（见 3.5），再驱动内部 SHM 与 `on_frame`。
 
-源码：[examples/agora_manager_demo.c](examples/agora_manager_demo.c)，`make all` 生成 `build/agora_manager_demo`。
+### 3.4 与 SHM IPC（规划）
 
-**命令行（三参数）：**
+- 实现文件内 `#include` `agora_shm_ipc.h` / `agora_localsock.h`；**`on_frame` 在成功 `agora_shm_ipc_read` 后、释锁后调用**。
 
-```text
-./build/agora_manager_demo <notify_write_bind> <notify_peer_recv> <write_shm_name>
+### 3.5 APP 报文 payload 格式（定稿）
+
+- **`msg_type == AGORA_LOCALSOCK_MSG_APP`（2）** 时，**payload 主体**为 **`AgoraShmIpcHeader` 的整头裸字节**，长度为 **`sizeof(AgoraShmIpcHeader)`**，语义与旧 **`agora_shm_ipc_notify_post_write` / Unix notify** 发送的头快照 **一致**，便于从中读取 `shm_name`、`payload_size`、`magic`/`version` 等并 **`agora_shm_ipc_open` / `agora_shm_ipc_read`**。
+- UDP 报文布局：**12 字节 `agora_localsock_header`** + **`payload_len` 字节**，其中上述情况 **`payload_len == sizeof(AgoraShmIpcHeader)`** 且内容为一帧头镜像。
+
+### 3.6 `agora_shm_manager_add` / `agora_shm_manager_remove`
+
+- **读表 / 写表**：内部 **`read_entries`**（UDP 自动附着读，最多 64）与 **`write_entries`**（`add` 登记的写端创建，最多 64）分离；**`close`** 时两套表项均 **`agora_shm_ipc_close`**。
+- **`add`**：`agora_shm_ipc_open(shm_name, max_payload_size, is_creator=1)` + **`agora_shm_ipc_writer_session_begin`**；`max_payload_size == 0` → `EINVAL`；写表或读表已存在同名 → **`EEXIST`**；写表满 → **`ENOMEM`**；其它失败透传 **`errno`**。
+- **`remove`**：先查写表移除并 close；否则查读表；两处都无 → **`ENOENT`**。
+- **UDP 派发**：若 `shm_name` 已在写表登记，**不再**为该名自动打开读附着（避免同 manager 内读写双持同一名的歧义）。
+
+### 3.7 WRITECMD 与 `agora_shm_manager_write`
+
+- **`msg_type == AGORA_LOCALSOCK_MSG_WRITECMD`（3）**：UDP 负载为 **`sizeof(AgoraShmIpcFrameMeta)`** 的裸 meta；接收侧若读表尚无该 `shm_name`，则 **`shm_open` + `mmap` 头** 探测 **`payload_size`** 后再 **`agora_shm_ipc_open` 附着读** 并 **`agora_shm_ipc_read` / `on_frame`**（与 APP 头镜像路径等价信息）。
+- **`agora_shm_manager_write`**：仅在**写表**命中 `shm_name` 时 **`agora_shm_ipc_write`**；随后 **server** 调用 **`agora_localsock_server_send_datagram`** 向已登记 peer **广播** WRITECMD；**client** 调用 **`agora_localsock_client_send_datagram`**。无 peer 时 server 侧信令 **返回 0**（写已成功）。**`meta` 不可为 NULL**（`EINVAL`）。
+
+## 四、与旧版差异（摘要）
+
+| 项目 | 旧版 | 新版 |
+|------|------|------|
+| 信令 | Unix `notify` | localsocket UDP |
+| demo | 三参数 Unix 路径 | **仅** port + server_mode + localsock 参数（不并存） |
+| `add`/`remove` | 有逻辑 | **读写分表** + `add(max_payload_size)` / `remove` 按名 |
+
+## 五、并发与生命周期
+
+- **`agora_shm_manager_close`**：stop → **join** → 销毁 localsock → 关闭读表与写表全部 SHM 槽位 → `free`。
+- **禁止持锁**调用 `on_frame`。
+
+## 六、依赖与构建
+
+- 链接：**`agora_shm_ipc.o`** + **`agora_localsock.o`** + **`pthread`**；**不要** `agora_shm_ipc_notify.o`（manager 不链接 notify）。
+
+## 七、图示
+
+```mermaid
+flowchart TB
+  subgraph mgr [AgoraShmManager .c]
+    LS[localsock server or client]
+    TH[Worker pthread]
+    SIG[onIPCSignal]
+    IPC[agora_shm_ipc_* internal]
+  end
+  TH --> LS
+  LS --> SIG
+  SIG --> IPC
+  IPC -->|on_frame| App[User]
 ```
 
-- **`notify_write_bind`**：本进程 **`agora_shm_ipc_notify_writer_init` 的 bind 路径**（写端本地 Unix 路径）。
-- **`notify_peer_recv`**：每次 **`agora_shm_ipc_write` 后 `sendto` 的目标路径**，必须为 **对端进程 manager 的 `notify_reader_init` 绑定路径**。
-- **`write_shm_name`**：本进程 **`agora_shm_ipc_open` + `write` 使用的 POSIX SHM 名**。
+## 八、实施顺序
 
-**约定（demo 内实现，便于双进程对称配置）：**
+1. 在 **`agora_localsock`** 实现 **`agora_localsock_client_poll`**（见 PLAN_localsocket）。
+2. 重写 **`agora_shm_manager.h` / `.c`** 与 **`agora_manager_demo`**，删除旧 notify 启动路径，**不并存**。
+3. 实现 `start` / `close` / 线程 / 500ms client keepalive / `onIPCSignal` 占位或解析。
+4. 后续：`onIPCSignal` 全逻辑、`add`/`remove`、表驱动 `on_frame`。
 
-- 本进程 **manager** 的接收路径 **不是** 命令行第 4 个参数，而是由 **`notify_write_bind` 追加后缀 `".recv"`** 得到（长度须小于 `sockaddr_un.sun_path`）。因此双进程时：**进程 B 的 `notify_peer_recv` = 进程 A 的 `notify_write_bind` + `".recv"`**，反之亦然。
+---
 
-**双进程对称示例：**
-
-- 进程 A：`./build/agora_manager_demo /tmp/am_a /tmp/am_b.recv /agsh_a`
-- 进程 B：`./build/agora_manager_demo /tmp/am_b /tmp/am_a.recv /agsh_b`
-
-各自创建/附着自己的 `write_shm_name`；**无需** `agora_shm_manager_add` 对端 SHM 即可工作：工作线程收到通知后按头内 **`shm_name` / `payload_size`** **自动 `open` 读附着** 对端段（`ENOENT` 则丢包，见上节）。demo 内 **`payload_size` 固定 4096**。
-
-## 实施顺序
-
-1. 定稿本 PLAN（本文件）。
-2. 实现 `start` / `close` / 监听线程 / 回调 + **ENOENT 即丢包**。
-3. 实现 `add` / `remove` 与读写角色字段。
-4. **示例**：见上节「示例 `agora_manager_demo`」；与底层 `agora_writer_demo` / `agora_reader_demo` 可独立联调。
+**文档版本**：2026-04-15；合并定稿：**`AgoraShmIpcFrameMeta` 回调**、**`localsock_max_clients` + `localsock_keepalive_ms`**、**`agora_localsock_client_poll`**、**client 线程 500ms keepalive**、**port 非法规则**、**add/remove ENOSYS**、**不并存**、**APP payload = 整头 `AgoraShmIpcHeader`**。

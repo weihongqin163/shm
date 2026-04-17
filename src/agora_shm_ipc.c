@@ -1,7 +1,7 @@
 /**
  * created by:wei
  * copyright (c) 2026 Agora IO. All rights reserved.
- * date: 2026-04-13
+ * date: 2026-04-15
  */
 
 #include "agora_shm_ipc.h"
@@ -69,11 +69,6 @@ static void agora_shm_ipc_copy_meta_out(AgoraShmIpcFrameMeta *dst,
 
 static size_t agora_shm_ipc_total_size(size_t payload_size) {
   return sizeof(AgoraShmIpcHeader) + payload_size;
-}
-
-static socklen_t agora_sockaddr_un_len(const struct sockaddr_un *sa) {
-  return (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
-                     strlen(sa->sun_path));
 }
 
 int agora_shm_ipc_open(const char *shm_name, size_t payload_size, int is_creator,
@@ -223,8 +218,7 @@ int agora_shm_ipc_writer_session_begin(AgoraShmIpc *ctx) {
 }
 
 int agora_shm_ipc_write(AgoraShmIpc *ctx, const void *data, size_t len,
-                        const AgoraShmIpcFrameMeta *meta,
-                        const AgoraShmIpcNotify *notify) {
+                        const AgoraShmIpcFrameMeta *meta) {
   if (!ctx || !ctx->header || !ctx->payload || !data) {
     errno = EINVAL;
     return -1;
@@ -241,11 +235,6 @@ int agora_shm_ipc_write(AgoraShmIpc *ctx, const void *data, size_t len,
   h->data_len = (uint32_t)len;
   atomic_thread_fence(memory_order_release);
   (void)atomic_fetch_add_explicit(&h->seq, 1u, memory_order_release);
-
-  if (notify != NULL && notify->fd >= 0 && notify->is_writer != 0) {
-    (void)sendto(notify->fd, h, sizeof(*h), 0, (struct sockaddr *)&notify->peer,
-                 notify->peer_len);
-  }
   return 0;
 }
 
@@ -296,127 +285,4 @@ int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len,
 
   errno = EAGAIN;
   return -1;
-}
-
-static int notify_bind_unix_dgram(int fd, const char *path,
-                                  char *out_path, size_t out_path_cap) {
-  if (!path || path[0] == '\0') {
-    errno = EINVAL;
-    return -1;
-  }
-  (void)unlink(path);
-
-  struct sockaddr_un sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sun_family = AF_UNIX;
-  if (strlen(path) >= sizeof(sa.sun_path)) {
-    errno = ENAMETOOLONG;
-    return -1;
-  }
-  memcpy(sa.sun_path, path, strlen(path) + 1u);
-
-  socklen_t slen = agora_sockaddr_un_len(&sa);
-  if (bind(fd, (struct sockaddr *)&sa, slen) != 0) {
-    return -1;
-  }
-
-  if (out_path != NULL && out_path_cap > 0u) {
-    (void)strncpy(out_path, path, out_path_cap - 1u);
-    out_path[out_path_cap - 1u] = '\0';
-  }
-  return 0;
-}
-
-int agora_shm_ipc_notify_writer_init(AgoraShmIpcNotify *n,
-                                     const char *writer_bind_path,
-                                     const char *reader_recv_path) {
-  if (!n || !writer_bind_path || !reader_recv_path ||
-      writer_bind_path[0] == '\0' || reader_recv_path[0] == '\0') {
-    errno = EINVAL;
-    return -1;
-  }
-
-  memset(n, 0, sizeof(*n));
-  n->fd = -1;
-
-  int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-  if (fd < 0) {
-    return -1;
-  }
-
-  if (notify_bind_unix_dgram(fd, writer_bind_path, n->bind_path,
-                             sizeof(n->bind_path)) != 0) {
-    int e = errno;
-    (void)close(fd);
-    errno = e;
-    return -1;
-  }
-
-  memset(&n->peer, 0, sizeof(n->peer));
-  n->peer.sun_family = AF_UNIX;
-  if (strlen(reader_recv_path) >= sizeof(n->peer.sun_path)) {
-    (void)close(fd);
-    (void)unlink(writer_bind_path);
-    errno = ENAMETOOLONG;
-    return -1;
-  }
-  memcpy(n->peer.sun_path, reader_recv_path, strlen(reader_recv_path) + 1u);
-  n->peer_len = agora_sockaddr_un_len(&n->peer);
-
-  n->has_bind_path = 1;
-  n->is_writer = 1;
-  n->fd = fd;
-  return 0;
-}
-
-int agora_shm_ipc_notify_reader_init(AgoraShmIpcNotify *n,
-                                     const char *reader_recv_path) {
-  if (!n || !reader_recv_path || reader_recv_path[0] == '\0') {
-    errno = EINVAL;
-    return -1;
-  }
-
-  memset(n, 0, sizeof(*n));
-  n->fd = -1;
-
-  int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-  if (fd < 0) {
-    return -1;
-  }
-
-  if (notify_bind_unix_dgram(fd, reader_recv_path, n->bind_path,
-                             sizeof(n->bind_path)) != 0) {
-    int e = errno;
-    (void)close(fd);
-    errno = e;
-    return -1;
-  }
-
-  n->has_bind_path = 1;
-  n->is_writer = 0;
-  n->fd = fd;
-  return 0;
-}
-
-int agora_shm_ipc_notify_fd(const AgoraShmIpcNotify *n) {
-  if (!n || n->fd < 0) {
-    errno = EINVAL;
-    return -1;
-  }
-  return n->fd;
-}
-
-void agora_shm_ipc_notify_fini(AgoraShmIpcNotify *n) {
-  if (!n) {
-    return;
-  }
-  if (n->fd >= 0) {
-    (void)close(n->fd);
-    n->fd = -1;
-  }
-  if (n->has_bind_path != 0 && n->bind_path[0] != '\0') {
-    (void)unlink(n->bind_path);
-    n->bind_path[0] = '\0';
-    n->has_bind_path = 0;
-  }
 }

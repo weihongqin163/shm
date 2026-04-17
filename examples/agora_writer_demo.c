@@ -1,10 +1,11 @@
 /**
  * created by:wei
  * copyright (c) 2026 Agora IO. All rights reserved.
- * date: 2026-04-13
+ * date: 2026-04-15
  */
 
 #include "agora_shm_ipc.h"
+#include "agora_shm_ipc_notify.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -75,7 +76,6 @@ int main(int argc, char **argv) {
     agora_shm_ipc_close(&ctx);
     return 1;
   }
-
   uint8_t *buf = (uint8_t *)malloc(payload_size);
   if (!buf) {
     fprintf(stderr, "malloc failed\n");
@@ -107,8 +107,12 @@ int main(int argc, char **argv) {
     meta.channels = 2;
     meta.bits = 16;
 
-    if (agora_shm_ipc_write(&ctx, buf, send_len, &meta, &notify) != 0) {
+    if (agora_shm_ipc_write(&ctx, buf, send_len, &meta) != 0) {
       perror("agora_shm_ipc_write");
+      break;
+    }
+    if (agora_shm_ipc_notify_post_write(&ctx, &notify) != 0) {
+      perror("agora_shm_ipc_notify_post_write");
       break;
     }
     printf("writer seq=%u, frame=%u\n", ctx.header->seq, seq);

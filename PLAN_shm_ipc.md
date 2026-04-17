@@ -32,7 +32,7 @@
 - `sample_rate` / `channels` / `bits`：`int32_t`，音频属性（视频帧可置 0）。
 - `seq`（`atomic_uint`）：**偶数** = 稳定态可读；**奇数** = 写入中。初始 `0`。
 
-写接口 `agora_shm_ipc_write(..., meta, notify)` 在 seqlock 内写入上述元数据与 payload；`meta == NULL` 时将该帧元数据清零。读接口 `agora_shm_ipc_read(..., out_meta)` 可在 `out_meta != NULL` 时取与稳定 payload 同一快照的元数据。
+写接口 `agora_shm_ipc_write(..., meta)` 在 seqlock 内写入上述元数据与 payload；`meta == NULL` 时将该帧元数据清零；**不**包含 Unix notify。上层在写成功后调用 **`agora_shm_ipc_notify_post_write`**（`agora_shm_ipc_notify.h`）对读端 `sendto` 整头快照。读接口 `agora_shm_ipc_read(..., out_meta)` 可在 `out_meta != NULL` 时取与稳定 payload 同一快照的元数据。
 
 ## seqlock 协议
 
@@ -54,7 +54,7 @@
 
 1. **读进程**：`agora_shm_ipc_notify_reader_init` → `socket` + **`bind(reader_recv_path)`**（必要时先 `unlink` 路径文件）。
 2. **写进程**：`agora_shm_ipc_notify_writer_init` → **`bind(writer_bind_path)`** + 记录对端 `reader_recv_path`。
-3. 每次 `agora_shm_ipc_write(..., meta, notify)` 成功提交共享内存后，向 **`reader_recv_path`** `sendto` 一帧 **`AgoraShmIpcHeader`** 大小的快照（与映射区头布局一致），读端 `recv` 缓冲区至少为该大小。
+3. 每次 `agora_shm_ipc_write(..., meta)` 成功提交共享内存后，由上层调用 **`agora_shm_ipc_notify_post_write`**，向 **`reader_recv_path`** `sendto` 一帧 **`AgoraShmIpcHeader`** 大小的快照（与映射区头布局一致），读端 `recv` 缓冲区至少为该大小。
 
 两端使用 **文件系统路径**（macOS 无 Linux abstract namespace）。路径长度受 `sockaddr_un.sun_path` 限制。
 
@@ -63,7 +63,7 @@
 - `agora_shm_ipc_open` / `agora_shm_ipc_close` / `agora_shm_ipc_unlink`
 - `agora_shm_ipc_writer_session_begin`
 - `agora_shm_ipc_write` / `agora_shm_ipc_read`
-- `agora_shm_ipc_notify_writer_init` / `agora_shm_ipc_notify_reader_init` / `agora_shm_ipc_notify_fd` / `agora_shm_ipc_notify_fini`
+- `agora_shm_ipc_notify_*`（`agora_shm_ipc_notify.h` / `agora_shm_ipc_notify.c`）：`notify_writer_init` / `notify_reader_init` / `notify_fd` / `notify_fini` / **`notify_post_write`**
 
 错误：以 **`-1` + `errno`** 为主；无稳定帧可读时 **`errno=EAGAIN`**。
 
@@ -80,5 +80,6 @@
 
 ## 源码位置
 
-- 头文件 / 实现：[src/agora_shm_ipc.h](src/agora_shm_ipc.h)、[src/agora_shm_ipc.c](src/agora_shm_ipc.c)
+- SHM 头文件 / 实现：[src/agora_shm_ipc.h](src/agora_shm_ipc.h)、[src/agora_shm_ipc.c](src/agora_shm_ipc.c)
+- Notify 头文件 / 实现：[src/agora_shm_ipc_notify.h](src/agora_shm_ipc_notify.h)、[src/agora_shm_ipc_notify.c](src/agora_shm_ipc_notify.c)
 - 示例：[examples/agora_writer_demo.c](examples/agora_writer_demo.c)、[examples/agora_reader_demo.c](examples/agora_reader_demo.c)

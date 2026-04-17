@@ -9,11 +9,12 @@
 
 #include <errno.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -45,51 +46,46 @@ static void on_frame(const char *shm_name, const void *payload, size_t len,
          (int)meta->width, (int)meta->height);
 }
 
-/** Manager binds notify_write_bind + ".recv" (must fit sockaddr_un.sun_path). */
-static int build_manager_recv_path(char *out, size_t out_cap,
-                                   const char *notify_write_bind) {
-  const char *suf = ".recv";
-  size_t nb = strlen(notify_write_bind);
-  size_t sl = strlen(suf);
-  if (nb == 0u || nb + sl + 1u > out_cap) {
-    errno = EINVAL;
-    return -1;
-  }
-  if (nb + sl >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
-    errno = ENAMETOOLONG;
-    return -1;
-  }
-  (void)memcpy(out, notify_write_bind, nb);
-  (void)memcpy(out + nb, suf, sl + 1u);
-  return 0;
-}
-
 int main(int argc, char **argv) {
   (void)setvbuf(stdout, NULL, _IOLBF, 0);
 
-  if (argc != 4) {
+  if (argc != 6) {
     fprintf(stderr,
-            "usage: %s <notify_write_bind> <notify_peer_recv> <write_shm_name>\n"
-            "  notify_write_bind : local path for writer notify bind\n"
-            "  notify_peer_recv  : peer path for sendto after each write\n"
-            "  write_shm_name    : POSIX shm for this process (ipc write)\n"
-            "  manager listens on: <notify_write_bind>.recv\n",
+            "usage: %s <port> <server_mode 0|1> <max_clients> <keepalive_ms> "
+            "<write_shm_name>\n"
+            "  After start: agora_shm_manager_add then loop "
+            "agora_shm_manager_write every 200ms.\n",
             argc > 0 ? argv[0] : "agora_manager_demo");
     return 1;
   }
 
-  const char *notify_write_bind = argv[1];
-  const char *notify_peer_recv = argv[2];
-  const char *write_shm_name = argv[3];
+  unsigned long port_ul = strtoul(argv[1], NULL, 10);
+  if (port_ul == 0ul || port_ul > 65535ul) {
+    fprintf(stderr, "invalid port\n");
+    return 1;
+  }
+  uint16_t port = (uint16_t)port_ul;
 
-  char my_manager_recv[sizeof(((struct sockaddr_un *)0)->sun_path)];
-  if (build_manager_recv_path(my_manager_recv, sizeof(my_manager_recv),
-                              notify_write_bind) != 0) {
-    perror("build_manager_recv_path");
+  if (argv[2][0] == '\0' || argv[2][1] != '\0' ||
+      (argv[2][0] != '0' && argv[2][0] != '1')) {
+    fprintf(stderr, "server_mode must be 0 or 1\n");
+    return 1;
+  }
+  bool server_mode = (argv[2][0] == '1');
+
+  unsigned long max_cli = strtoul(argv[3], NULL, 10);
+  if (max_cli == 0ul) {
+    fprintf(stderr, "max_clients must be > 0 (used in server mode)\n");
     return 1;
   }
 
-  const size_t k_payload = 4096u;
+  unsigned long ka_ms = strtoul(argv[4], NULL, 10);
+  if (ka_ms == 0ul) {
+    fprintf(stderr, "keepalive_ms must be > 0 (used in server mode)\n");
+    return 1;
+  }
+
+  const char *write_shm_name = argv[5];
 
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
@@ -99,52 +95,28 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  AgoraShmIpc my_writer;
-  memset(&my_writer, 0, sizeof(my_writer));
-  if (agora_shm_ipc_open(write_shm_name, k_payload, 1, &my_writer) != 0) {
-    if (errno == EEXIST) {
-      if (agora_shm_ipc_open(write_shm_name, k_payload, 0, &my_writer) != 0) {
-        perror("agora_shm_ipc_open write_shm attach");
-        return 1;
-      }
-    } else {
-      perror("agora_shm_ipc_open write_shm create");
-      return 1;
-    }
-  }
-  if (agora_shm_ipc_writer_session_begin(&my_writer) != 0) {
-    perror("agora_shm_ipc_writer_session_begin");
-    agora_shm_ipc_close(&my_writer);
-    return 1;
-  }
+  const size_t k_payload = 4096u;
 
   AgoraShmManager *mgr = NULL;
-  if (agora_shm_manager_start(my_manager_recv, on_frame, NULL, k_payload, &mgr) !=
-      0) {
+  if (agora_shm_manager_start(on_frame, port, server_mode, (size_t)max_cli,
+                              (uint32_t)ka_ms, NULL, k_payload, &mgr) != 0) {
     perror("agora_shm_manager_start");
-    agora_shm_ipc_close(&my_writer);
     return 1;
   }
 
-  AgoraShmIpcNotify wnotify;
-  memset(&wnotify, 0, sizeof(wnotify));
-  if (agora_shm_ipc_notify_writer_init(&wnotify, notify_write_bind,
-                                       notify_peer_recv) != 0) {
-    perror("agora_shm_ipc_notify_writer_init");
+  if (agora_shm_manager_add(mgr, write_shm_name, k_payload) != 0) {
+    perror("agora_shm_manager_add");
     agora_shm_manager_close(mgr);
-    agora_shm_ipc_close(&my_writer);
     return 1;
   }
 
-  printf("agora_manager_demo writer_bind=%s sendto=%s write_shm=%s "
-         "manager_recv=%s (Ctrl+C exit)\n",
-         notify_write_bind, notify_peer_recv, write_shm_name, my_manager_recv);
+  printf("agora_manager_demo port=%u server_mode=%d max_clients=%lu "
+         "keepalive_ms=%lu write_shm=%s add+write 200ms (Ctrl+C exit)\n",
+         (unsigned)port, server_mode ? 1 : 0, max_cli, ka_ms, write_shm_name);
 
   uint8_t *buf = (uint8_t *)malloc(k_payload);
   if (buf == NULL) {
-    agora_shm_ipc_notify_fini(&wnotify);
     agora_shm_manager_close(mgr);
-    agora_shm_ipc_close(&my_writer);
     return 1;
   }
 
@@ -167,17 +139,16 @@ int main(int argc, char **argv) {
     meta.channels = 2;
     meta.bits = 16;
 
-    if (agora_shm_ipc_write(&my_writer, buf, send_len, &meta, &wnotify) != 0) {
-      perror("agora_shm_ipc_write");
+    if (agora_shm_manager_write(mgr, write_shm_name, buf, send_len, &meta) !=
+        0) {
+      perror("agora_shm_manager_write");
       break;
     }
     ++seq;
-    sleep_ms(330);
+    sleep_ms(200);
   }
 
   free(buf);
-  agora_shm_ipc_notify_fini(&wnotify);
   agora_shm_manager_close(mgr);
-  agora_shm_ipc_close(&my_writer);
   return 0;
 }
