@@ -95,7 +95,7 @@ int agora_localsock_server_send_datagram(agora_localsock_server *s,
 size_t agora_localsock_server_peer_count(const agora_localsock_server *s);
 
 /**
- * Creates a client connected to 127.0.0.1:server_port (no explicit bind).
+ * Creates a UDP datagram socket (no connect). Sends use sendto to 127.0.0.1:server_port.
  * Keep-alive timing is owned by the application: call
  * agora_localsock_client_send_keepalive() from your business loop on a period
  * compatible with the server's keepalive_interval_ms (server evicts after

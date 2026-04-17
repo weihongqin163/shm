@@ -35,8 +35,17 @@ struct agora_localsock_server {
 
 struct agora_localsock_client {
   int fd;
+  uint16_t server_port;
   pthread_mutex_t mu;
 };
+
+static void client_peer_addr(const agora_localsock_client *c,
+                             struct sockaddr_in *out) {
+  memset(out, 0, sizeof(*out));
+  out->sin_family = AF_INET;
+  out->sin_port = htons(c->server_port);
+  (void)inet_pton(AF_INET, "127.0.0.1", &out->sin_addr);
+}
 
 typedef enum {
   AGORA_LS_PARSE_INVALID = 0,
@@ -392,26 +401,8 @@ int agora_localsock_client_create(uint16_t server_port,
     errno = e;
     return -1;
   }
-  struct sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(server_port);
-  if (inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1) {
-    close(fd);
-    pthread_mutex_destroy(&c->mu);
-    free(c);
-    errno = EINVAL;
-    return -1;
-  }
-  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-    int e = errno;
-    close(fd);
-    pthread_mutex_destroy(&c->mu);
-    free(c);
-    errno = e;
-    return -1;
-  }
   c->fd = fd;
+  c->server_port = server_port;
   *out = c;
   return 0;
 }
@@ -456,7 +447,9 @@ int agora_localsock_client_poll(agora_localsock_client *c, int timeout_ms,
     errno = EIO;
     return -1;
   }
-  ssize_t nr = recv(c->fd, buf, cap, 0);
+  struct sockaddr_in src;
+  socklen_t srclen = (socklen_t)sizeof(src);
+  ssize_t nr = recvfrom(c->fd, buf, cap, 0, (struct sockaddr *)&src, &srclen);
   if (nr < 0) {
     int e = errno;
     pthread_mutex_unlock(&c->mu);
@@ -475,8 +468,12 @@ int agora_localsock_client_send_keepalive(agora_localsock_client *c) {
   }
   uint8_t pkt[AGORA_LOCALSOCK_HEADER_BYTES];
   (void)pack_keepalive(pkt);
+  struct sockaddr_in peer;
+  client_peer_addr(c, &peer);
   pthread_mutex_lock(&c->mu);
-  ssize_t nw = send(c->fd, pkt, sizeof(pkt), 0);
+  ssize_t nw =
+      sendto(c->fd, pkt, sizeof(pkt), 0, (struct sockaddr *)&peer,
+             (socklen_t)sizeof(peer));
   pthread_mutex_unlock(&c->mu);
   if (nw != (ssize_t)sizeof(pkt)) {
     if (nw < 0) {
@@ -517,8 +514,12 @@ int agora_localsock_client_send_datagram(agora_localsock_client *c,
   if (payload_len > 0u) {
     memcpy(buf + AGORA_LOCALSOCK_HEADER_BYTES, payload, payload_len);
   }
+  struct sockaddr_in peer;
+  client_peer_addr(c, &peer);
   pthread_mutex_lock(&c->mu);
-  ssize_t nw = send(c->fd, buf, total, 0);
+  ssize_t nw =
+      sendto(c->fd, buf, total, 0, (struct sockaddr *)&peer,
+             (socklen_t)sizeof(peer));
   pthread_mutex_unlock(&c->mu);
   free(buf);
   if (nw != (ssize_t)total) {
