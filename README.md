@@ -37,7 +37,7 @@ make clean && make all
 
 ## agora_shm_manager（localsocket + SHM）
 
-- **职责**：`agora_shm_manager_start` 在 **127.0.0.1 UDP** 上以 **server**（绑定端口）或 **client**（`connect` 对端端口）运行 localsocket，并起 **一条** worker 线程：`server_poll` / `client_poll` 收到 **APP**（整帧 `AgoraShmIpcHeader`）或 **WRITECMD**（`AgoraShmIpcFrameMeta`）后，在读表中查找或 **自动附着读 SHM**，再 **`agora_shm_ipc_read`**，释锁后调用 **`on_frame`**。
+- **职责**：`agora_shm_manager_start` 在 **127.0.0.1 UDP** 上以 **server**（绑定端口）或 **client**（`connect` 对端端口）运行 localsocket，并起 **一条** worker 线程：`server_poll` / `client_poll` 收到 **APP**（整帧 `AgoraShmIpcHeader`）或 **WRITECMD**（`AgoraShmIpcFrameMeta`）后，在读表中查找或 **自动附着读 SHM**，再 **`agora_shm_ipc_read`**，释锁后调用 **`on_frame`**（回调参数为 **`const AgoraShmIpcHeader *hdr`**，与读接口 `out_hdr` 同源字段）。
 - **表**：读表、写表各最多 **64** 槽。**`agora_shm_manager_add(shm_name, max_payload_size)`**：写端创建并登记。**`agora_shm_manager_remove`**：先写表后读表。**`agora_shm_manager_write`**：写表上 `agora_shm_ipc_write`，再发 **WRITECMD** 信令。写表已占用的 `shm_name` 不会同时为该名自动开读。
 - **`agora_shm_manager_close`**：停止 worker；`close` 所有读/写 IPC；写槽若为 **`agora_shm_ipc_open(..., is_creator=1)`** 创建（`ipc.creator` 非零），在 close 后 **`agora_shm_ipc_unlink`**；再销毁 localsocket。
 - **设计细节**：[`PLAN_shm_ipc_manager.md`](PLAN_shm_ipc_manager.md)；localsocket 协议：[`PLAN_localsocket.md`](PLAN_localsocket.md)。
@@ -49,13 +49,13 @@ make clean && make all
 
 ### writer/reader demo（轮询读）
 
-- 写端只调用 **`agora_shm_ipc_write`**；读端在短 **`usleep`** 间隔下重试 **`agora_shm_ipc_read`**，并用 **`header->seq`** 去重，避免同一稳定帧重复打印。生产环境可用 **localsocket APP 整头**（与 manager 一致）替代忙等。
+- 写端只调用 **`agora_shm_ipc_write`**；读端在短 **`usleep`** 间隔下重试 **`agora_shm_ipc_read`**，可选 **`out_hdr`** 取头快照，并用 **`hdr.seq`** 去重，避免同一稳定帧重复打印。生产环境可用 **localsocket APP 整头**（与 manager 一致）替代忙等。
 
 ## 概念与约束（manager 场景）
 
 - **APP UDP**：`msg_type == 2`，payload 为 **`sizeof(AgoraShmIpcHeader)`** 的裸头（用于携带头快照以便对端附着/读 SHM）。
 - **WRITECMD**：`msg_type == 3`，payload 为 **`AgoraShmIpcFrameMeta`**；对端若无读表项，会 **probe** SHM 头得到 **`payload_size`** 再附着读。
-- **meta 生命周期**：`on_frame` 里的 **`AgoraShmIpcFrameMeta *`** 仅在回调返回前有效。
+- **hdr 生命周期**：`on_frame` 里的 **`const AgoraShmIpcHeader *hdr`** 仅在回调返回前有效。
 
 ## 写端流程（API，仅 SHM）
 

@@ -208,9 +208,8 @@ static void manager_dispatch_ipc_header(AgoraShmManager *m,
   AgoraShmIpc *ipc = &e->ipc;
 
   size_t out_len = 0u;
-  AgoraShmIpcFrameMeta meta;
-  memset(&meta, 0, sizeof(meta));
-  int rr = agora_shm_ipc_read(ipc, m->read_scratch, m->read_cap, &out_len, &meta);
+  AgoraShmIpcHeader snap;
+  int rr = agora_shm_ipc_read(ipc, m->read_scratch, m->read_cap, &out_len, &snap);
 
   char shm_name_cb[AGORA_SHM_IPC_SHM_NAME_BYTES];
   memcpy(shm_name_cb, e->shm_name, sizeof(shm_name_cb));
@@ -222,7 +221,7 @@ static void manager_dispatch_ipc_header(AgoraShmManager *m,
   pthread_mutex_unlock(&m->lock);
 
   if (rr == 0 && cb != NULL) {
-    cb(shm_name_cb, m->read_scratch, out_len, &meta, user);
+    cb(shm_name_cb, m->read_scratch, out_len, &snap, user);
   }
 }
 
@@ -392,7 +391,7 @@ static void *agora_shm_manager_worker_client(void *arg) {
 int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t port,
                             bool server_mode, size_t localsock_max_clients,
                             uint32_t localsock_keepalive_ms, void *user,
-                            size_t max_payload_size, AgoraShmManager **out) {
+                            size_t max_read_cap, AgoraShmManager **out) {
   if (on_frame == NULL || out == NULL || port == 0u) {
     errno = EINVAL;
     return -1;
@@ -404,7 +403,7 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
     }
   }
 
-  size_t cap = max_payload_size;
+  size_t cap = max_read_cap;
   if (cap == 0u) {
     cap = AGORA_SHM_MANAGER_DEFAULT_READ_CAP;
   }

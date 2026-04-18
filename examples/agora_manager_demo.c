@@ -33,17 +33,17 @@ static void sleep_ms(int ms) {
 }
 
 static void on_frame(const char *shm_name, const void *payload, size_t len,
-                     const AgoraShmIpcFrameMeta *meta, void *user) {
+                     const AgoraShmIpcHeader *hdr, void *user) {
   (void)payload;
   (void)user;
-  if (meta == NULL) {
+  if (hdr == NULL) {
     printf("[MANAGER] shm=%s len=%zu\n", shm_name, len);
     return;
   }
-  printf("[MANAGER] shm=%s len=%zu user_id=%.16s... media=%u stream=%u "
-         "wxh=%dx%d\n",
-         shm_name, len, meta->user_id, meta->media_type, meta->stream_type,
-         (int)meta->width, (int)meta->height);
+  printf("[MANAGER] on_frame shm=%s len=%zu user_id=%.16s... media=%u stream=%u seq=%u "
+         "wxh=%dx%d audio %d/%d/%d\n",
+         shm_name, len, hdr->user_id, hdr->media_type, hdr->stream_type, (unsigned)hdr->seq,
+         (int)hdr->width, (int)hdr->height, (int)hdr->sample_rate, (int)hdr->channels, (int)hdr->bits);
 }
 
 int main(int argc, char **argv) {
@@ -95,11 +95,25 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  const size_t k_payload = 4096u;
+  const size_t k_payload_video = (1920 * 1080 * 3) / 2;
+  const size_t k_payload_audio = 48000 * 1 * 2 / 8;
+  // Worker read scratch must fit any peer SHM this demo may attach (video >=
+  // audio); per-mode k_payload below is only for local writer SHM + writes.
+  const size_t k_manager_read_cap =
+      (k_payload_video > k_payload_audio) ? k_payload_video : k_payload_audio;
+
+  size_t k_payload = 0;
+
+  if (server_mode) {
+    k_payload = k_payload_video;
+  } else {
+    k_payload = k_payload_audio;
+  }
 
   AgoraShmManager *mgr = NULL;
   if (agora_shm_manager_start(on_frame, port, server_mode, (size_t)max_cli,
-                              (uint32_t)ka_ms, NULL, k_payload, &mgr) != 0) {
+                              (uint32_t)ka_ms, NULL, k_manager_read_cap,
+                              &mgr) != 0) {
     perror("agora_shm_manager_start");
     return 1;
   }
@@ -125,19 +139,31 @@ int main(int argc, char **argv) {
     for (size_t j = 0u; j < k_payload; ++j) {
       buf[j] = (uint8_t)((seq + (unsigned)j) & 0xFFu);
     }
-    size_t send_len = 256u;
+    size_t send_len = k_payload;
 
     AgoraShmIpcFrameMeta meta;
     memset(&meta, 0, sizeof(meta));
     (void)snprintf(meta.user_id, sizeof(meta.user_id), "mgr-demo");
     (void)strncpy(meta.shm_name, write_shm_name, sizeof(meta.shm_name) - 1u);
-    meta.media_type = (uint32_t)AGORA_SHM_MEDIA_VIDEO;
-    meta.stream_type = (uint32_t)AGORA_SHM_STREAM_MAIN;
-    meta.width = 640;
-    meta.height = 480;
-    meta.sample_rate = 48000;
-    meta.channels = 2;
-    meta.bits = 16;
+    if (server_mode) {
+      meta.media_type = (uint32_t)AGORA_SHM_MEDIA_VIDEO;
+      meta.stream_type = (uint32_t)AGORA_SHM_STREAM_MAIN;
+      meta.width = 1920;
+      meta.height = 1080;
+      meta.sample_rate = 0;
+      meta.channels = 0;
+      meta.bits = 0;
+      send_len = k_payload_video;
+    } else {
+      meta.media_type = (uint32_t)AGORA_SHM_MEDIA_AUDIO;
+      meta.stream_type = (uint32_t)AGORA_SHM_STREAM_MAIN;
+      meta.width = 0;
+      meta.height = 0;
+      meta.sample_rate = 48000;
+      meta.channels = 1;
+      meta.bits = 16;
+      send_len = k_payload_audio;
+    }
 
     if (agora_shm_manager_write(mgr, write_shm_name, buf, send_len, &meta) !=
         0) {

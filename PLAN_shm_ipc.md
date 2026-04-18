@@ -32,7 +32,7 @@
 - `sample_rate` / `channels` / `bits`：`int32_t`，音频属性（视频帧可置 0）。
 - `seq`（`atomic_uint`）：**偶数** = 稳定态可读；**奇数** = 写入中。初始 `0`。
 
-写接口 `agora_shm_ipc_write(..., meta)` 在 seqlock 内写入上述元数据与 payload；`meta == NULL` 时将该帧元数据清零；**不**包含任何套接字发送。读接口 `agora_shm_ipc_read(..., out_meta)` 可在 `out_meta != NULL` 时取与稳定 payload 同一快照的元数据。
+写接口 `agora_shm_ipc_write(..., meta)` 在 seqlock 内写入上述元数据与 payload；`meta == NULL` 时将该帧元数据清零；**不**包含任何套接字发送。读接口 `agora_shm_ipc_read(..., out_hdr)` 可在 `out_hdr != NULL` 时取与稳定 payload 同一快照的 **整头**（含 `magic`/`version`/`payload_size`/`data_len`/`seq` 等）。
 
 ## seqlock 协议
 

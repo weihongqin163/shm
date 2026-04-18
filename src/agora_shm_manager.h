@@ -17,7 +17,7 @@ typedef struct AgoraShmManager AgoraShmManager;
 
 typedef void (*agora_shm_manager_on_frame_fn)(const char *shm_name,
                                               const void *payload, size_t len,
-                                              const AgoraShmIpcFrameMeta *meta,
+                                              const AgoraShmIpcHeader *hdr,
                                               void *user);
 
 /**
@@ -29,14 +29,14 @@ typedef void (*agora_shm_manager_on_frame_fn)(const char *shm_name,
  * localsock_max_clients / localsock_keepalive_ms are used only when
  * server_mode is true (passed to agora_localsock_server_create).
  *
- * max_payload_size: worker SHM read buffer; 0 selects an implementation default.
+ * max_read_cap: worker SHM read scratch size; 0 selects an implementation default.
  *
- * @param meta in on_frame is valid only until the callback returns.
+ * @param hdr in on_frame is valid only until the callback returns.
  */
 int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t port,
                             bool server_mode, size_t localsock_max_clients,
                             uint32_t localsock_keepalive_ms, void *user,
-                            size_t max_payload_size, AgoraShmManager **out);
+                            size_t max_read_cap, AgoraShmManager **out);
 
 /**
  * Stops the worker thread, agora_shm_ipc_close on all read/write entries; for

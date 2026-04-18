@@ -6,7 +6,7 @@
 
 1. **组合层**：`agora_shm_manager` 是对 **[`agora_shm_ipc`](src/agora_shm_ipc.h)**（POSIX SHM + seqlock）与 **[`agora_localsock`](src/agora_localsock.h)**（127.0.0.1 UDP）的 **组合编排层**，对外暴露 **`AgoraShmManager`** 与 `agora_shm_manager_*` API。
 2. **信令与唤醒**：manager 仅通过 **localsocket**（见 [`PLAN_localsocket.md`](PLAN_localsocket.md)）；仓库已移除 **`agora_shm_ipc_notify`** 模块。
-3. **类型隐藏（定稿修订）**：公开头文件中 **不出现** `AgoraShmIpc`、`AgoraShmIpcNotify` 指针及 **`agora_localsock_*` 符号**。为与 SHM 元数据 **定义完全一致**，**`on_frame` 使用 [`AgoraShmIpcFrameMeta`](src/agora_shm_ipc.h)**（manager.h **`#include "agora_shm_ipc.h"`** 仅用于该类型及必要常量；**不得**在公开 API 中暴露 `AgoraShmIpc *` 等句柄）。`AgoraShmIpc` / `agora_localsock_*` **仅**出现在 **manager.c** 内部。
+3. **类型隐藏（定稿修订）**：公开头文件中 **不出现** `AgoraShmIpc`、`AgoraShmIpcNotify` 指针及 **`agora_localsock_*` 符号**。**`on_frame` 使用 [`AgoraShmIpcHeader`](src/agora_shm_ipc.h)** 快照（与 `agora_shm_ipc_read` 的 `out_hdr` 一致；manager.h **`#include "agora_shm_ipc.h"`** 用于 `AgoraShmIpcHeader`、`AgoraShmIpcFrameMeta` 及必要常量；**不得**在公开 API 中暴露 `AgoraShmIpc *` 等句柄）。`AgoraShmIpc` / `agora_localsock_*` **仅**出现在 **manager.c** 内部。
 4. **纯 C**：`pthread`；**`bool`** 使用 `<stdbool.h>`。
 
 ## 二、对外 API（目标签名）
@@ -16,7 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "agora_shm_ipc.h"   /* for AgoraShmIpcFrameMeta only in public callback */
+#include "agora_shm_ipc.h"   /* AgoraShmIpcHeader in on_frame; FrameMeta for add/write */
 
 typedef struct AgoraShmManager AgoraShmManager;
 
@@ -24,7 +24,7 @@ typedef void (*agora_shm_manager_on_frame_fn)(
     const char *shm_name,
     const void *payload,
     size_t len,
-    const AgoraShmIpcFrameMeta *meta,
+    const AgoraShmIpcHeader *hdr,
     void *user);
 
 /**
@@ -32,7 +32,7 @@ typedef void (*agora_shm_manager_on_frame_fn)(
  * server_mode: true=localsocket server bind port；false=client connect 127.0.0.1:port。
  * localsock_max_clients: 仅 server 模式传入 `agora_localsock_server_create` 的 max_clients；client 模式可忽略（实现传占位或忽略）。
  * localsock_keepalive_ms: 传入 server 的 keepalive_interval_ms（5× 超时）；与 client 侧线程内 500ms keepalive **独立**（见 3.2）。
- * max_payload_size: 工作线程读 SHM 等上限（0=实现内默认）。
+ * max_read_cap: 工作线程读 SHM scratch 上限（0=实现内默认）。
  */
 int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
                             uint16_t port,
@@ -40,7 +40,7 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
                             size_t localsock_max_clients,
                             uint32_t localsock_keepalive_ms,
                             void *user,
-                            size_t max_payload_size,
+                            size_t max_read_cap,
                             AgoraShmManager **out);
 
 void agora_shm_manager_close(AgoraShmManager *m);
@@ -60,9 +60,9 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
                             const AgoraShmIpcFrameMeta *meta);
 ```
 
-### 回调与 `meta` 生命周期（定稿）
+### 回调与 `hdr` 生命周期（定稿）
 
-- **`meta` 指针**指向与当前帧一致的 **`AgoraShmIpcFrameMeta`** 数据；**仅在 `on_frame` 回调返回前有效**，返回后实现可复用或释放内部缓冲，**业务不得持有裸指针跨异步**。
+- **`hdr` 指针**指向与当前帧一致的 **`AgoraShmIpcHeader`** 快照（栈上或实现内缓冲）；**仅在 `on_frame` 回调返回前有效**，返回后不得再使用，**业务不得持有裸指针跨异步**。
 
 ## 三、实现逻辑
 

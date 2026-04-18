@@ -54,17 +54,25 @@ static void agora_shm_ipc_header_apply_meta(AgoraShmIpcHeader *h,
   }
 }
 
-static void agora_shm_ipc_copy_meta_out(AgoraShmIpcFrameMeta *dst,
-                                        const AgoraShmIpcHeader *h) {
-  memcpy(dst->user_id, h->user_id, sizeof(dst->user_id));
-  memcpy(dst->shm_name, h->shm_name, sizeof(dst->shm_name));
-  dst->media_type = h->media_type;
-  dst->stream_type = h->stream_type;
-  dst->width = h->width;
-  dst->height = h->height;
-  dst->sample_rate = h->sample_rate;
-  dst->channels = h->channels;
-  dst->bits = h->bits;
+static void agora_shm_ipc_copy_header_snapshot(AgoraShmIpcHeader *dst,
+                                              const AgoraShmIpcHeader *src) {
+  dst->magic = src->magic;
+  dst->version = src->version;
+  dst->payload_size = src->payload_size;
+  dst->data_len = src->data_len;
+  memcpy(dst->shm_name, src->shm_name, sizeof(dst->shm_name));
+  memcpy(dst->user_id, src->user_id, sizeof(dst->user_id));
+  dst->media_type = src->media_type;
+  dst->stream_type = src->stream_type;
+  dst->width = src->width;
+  dst->height = src->height;
+  dst->sample_rate = src->sample_rate;
+  dst->channels = src->channels;
+  dst->bits = src->bits;
+  atomic_store_explicit(
+      &dst->seq,
+      atomic_load_explicit(&src->seq, memory_order_relaxed),
+      memory_order_relaxed);
 }
 
 static size_t agora_shm_ipc_total_size(size_t payload_size) {
@@ -239,7 +247,7 @@ int agora_shm_ipc_write(AgoraShmIpc *ctx, const void *data, size_t len,
 }
 
 int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len,
-                       AgoraShmIpcFrameMeta *out_meta) {
+                       AgoraShmIpcHeader *out_hdr) {
   if (!ctx || !ctx->header || !ctx->payload || !buf || !out_len) {
     errno = EINVAL;
     return -1;
@@ -270,8 +278,8 @@ int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len,
     }
 
     memcpy(buf, ctx->payload, (size_t)len);
-    if (out_meta != NULL) {
-      agora_shm_ipc_copy_meta_out(out_meta, h);
+    if (out_hdr != NULL) {
+      agora_shm_ipc_copy_header_snapshot(out_hdr, h);
     }
 
     unsigned s2 =

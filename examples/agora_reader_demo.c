@@ -55,16 +55,15 @@ int main(int argc, char **argv) {
   for (;;) {
     (void)usleep(2000);
     size_t out_len = 0u;
-    AgoraShmIpcFrameMeta meta;
-    memset(&meta, 0, sizeof(meta));
-    if (agora_shm_ipc_read(&ctx, buf, payload_size, &out_len, &meta) != 0) {
+    AgoraShmIpcHeader hdr;
+    if (agora_shm_ipc_read(&ctx, buf, payload_size, &out_len, &hdr) != 0) {
       if (errno != EAGAIN) {
         perror("agora_shm_ipc_read");
       }
       continue;
     }
     unsigned cur =
-        atomic_load_explicit(&ctx.header->seq, memory_order_relaxed);
+        atomic_load_explicit(&hdr.seq, memory_order_relaxed);
     if (cur == last_seq) {
       continue;
     }
@@ -72,9 +71,9 @@ int main(int argc, char **argv) {
 
     printf("reader seq=%u, frame=%u shm=%s user_id=%.16s... media=%u stream=%u "
            "wxh=%dx%d audio %d/%d/%d\n",
-           cur, frame, meta.shm_name, meta.user_id, meta.media_type,
-           meta.stream_type, (int)meta.width, (int)meta.height,
-           (int)meta.sample_rate, (int)meta.channels, (int)meta.bits);
+           cur, frame, hdr.shm_name, hdr.user_id, hdr.media_type,
+           hdr.stream_type, (int)hdr.width, (int)hdr.height,
+           (int)hdr.sample_rate, (int)hdr.channels, (int)hdr.bits);
     ++frame;
   }
 

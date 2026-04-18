@@ -113,13 +113,13 @@ int agora_shm_ipc_write(AgoraShmIpc *ctx, const void *data, size_t len,
 /**
  * Reads the latest stable payload into buf.
  *
- * @param out_meta If non-NULL, filled with header metadata for the same stable
- *                 snapshot as the payload (inside seqlock validation).
+ * @param out_hdr If non-NULL, filled with a snapshot of the SHM header (same
+ *                stable snapshot as the payload; seq copied via atomic_load).
  * @return 0 on success, *out_len set. -1 with errno EAGAIN if no complete
  *         frame yet or concurrent write; ENOBUFS if cap < data_len; EINVAL /
  *         EIO for format issues.
  */
 int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len,
-                       AgoraShmIpcFrameMeta *out_meta);
+                       AgoraShmIpcHeader *out_hdr);
 
 #endif /* AGORA_SHM_IPC_H */
