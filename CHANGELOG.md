@@ -11,6 +11,17 @@
 
 （尚无条目。）
 
+## [1.0.1] - 2026-04-24
+
+### 破坏性 / API
+
+- **`agora_shm_ipc_read`**：第二参数改为 **`void **buf`**（调用方传入指针变量的地址）。**`*buf != NULL`** 时向该地址 **拷贝** payload（`cap >= data_len`）；**`*buf == NULL`** 时不拷贝，成功返回后 **` *buf = ctx->payload`**（映射区内视图）。调用方需改为例如 `void *p = stack_buf; agora_shm_ipc_read(ctx, &p, ...)` 或零拷贝 `void *p = NULL; ...`。
+- **`agora_shm_manager`**：不再内部分配 **read scratch**；worker 对 SHM 读使用 **`*buf == NULL`** 路径，**`on_frame` 的 `payload` 指向 SHM mmap**，与 **`hdr` 一样仅在回调返回前有效**。**`max_read_cap`** 语义为 **允许挂接/派发的最大帧 payload 长度**（`0` 仍为内置默认），不再表示堆上 scratch 大小。
+
+### 变更
+
+- **`agora_shm_manager_worker_server`**：原栈上 **`srv_poll_buf[AGORA_SHM_MANAGER_UDP_CAP]`** 改为线程入口 **`malloc`**、退出前 **`free`**，降低 worker 线程栈占用。
+
 ## [1.0.0] - 2026-04-15
 
 首个对外归纳版本，涵盖当前 **POSIX 共享内存 IPC**、**本机 UDP 信令** 与 **组合层 manager** 的整体形态。

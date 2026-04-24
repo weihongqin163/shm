@@ -23,7 +23,7 @@
 
 #define AGORA_SHM_MANAGER_MAX_ENTRIES 64
 #define AGORA_SHM_MANAGER_DEFAULT_READ_CAP (256u * 1024u)
-#define AGORA_SHM_MANAGER_UDP_CAP 65536u
+#define AGORA_SHM_MANAGER_UDP_CAP 2048u
 
 #define AGORA_SHM_IPC_MAGIC_EXPECT 0xA601C0DEu
 #define AGORA_SHM_IPC_VER_EXPECT 2u
@@ -311,14 +311,20 @@ static void manager_on_udp_datagram(AgoraShmManager *m, const uint8_t *data,
 static void *agora_shm_manager_worker_server(void *arg) {
   AgoraShmManager *m = (AgoraShmManager *)arg;
 
+  uint8_t *srv_poll_buf =
+      (uint8_t *)malloc((size_t)AGORA_SHM_MANAGER_UDP_CAP);
+  if (srv_poll_buf == NULL) {
+    return NULL;
+  }
+
   for (;;) {
     if (atomic_load_explicit(&m->stop, memory_order_acquire) != 0) {
       break;
     }
-    uint8_t srv_poll_buf[AGORA_SHM_MANAGER_UDP_CAP];
     size_t srv_poll_len = 0u;
     if (agora_localsock_server_poll(m->srv, 200, srv_poll_buf,
-                                    sizeof(srv_poll_buf), &srv_poll_len) != 0) {
+                                    (size_t)AGORA_SHM_MANAGER_UDP_CAP,
+                                    &srv_poll_len) != 0) {
       if (errno == EINTR) {
         continue;
       }
@@ -331,7 +337,8 @@ static void *agora_shm_manager_worker_server(void *arg) {
       }
       srv_poll_len = 0u;
       if (agora_localsock_server_poll(m->srv, 0, srv_poll_buf,
-                                      sizeof(srv_poll_buf), &srv_poll_len) != 0) {
+                                      (size_t)AGORA_SHM_MANAGER_UDP_CAP,
+                                      &srv_poll_len) != 0) {
         if (errno == EINTR) {
           continue;
         }
@@ -347,6 +354,7 @@ static void *agora_shm_manager_worker_server(void *arg) {
     }
   }
 
+  free(srv_poll_buf);
   return NULL;
 }
 
