@@ -246,7 +246,7 @@ int agora_shm_ipc_write(AgoraShmIpc *ctx, const void *data, size_t len,
   return 0;
 }
 
-int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len,
+int agora_shm_ipc_read(AgoraShmIpc *ctx, void **buf, size_t cap, size_t *out_len,
                        AgoraShmIpcHeader *out_hdr) {
   if (!ctx || !ctx->header || !ctx->payload || !buf || !out_len) {
     errno = EINVAL;
@@ -254,6 +254,8 @@ int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len,
   }
 
   AgoraShmIpcHeader *h = ctx->header;
+  const int copy_mode = (*buf != NULL);
+  void *const copy_dst = copy_mode ? *buf : NULL;
 
   const unsigned k_max_seqlock_spins = 65536u;
   for (unsigned spin = 0u; spin < k_max_seqlock_spins; ++spin) {
@@ -277,7 +279,9 @@ int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len,
       return -1;
     }
 
-    memcpy(buf, ctx->payload, (size_t)len);
+    if (copy_mode != 0) {
+      memcpy(copy_dst, ctx->payload, (size_t)len);
+    }
     if (out_hdr != NULL) {
       agora_shm_ipc_copy_header_snapshot(out_hdr, h);
     }
@@ -286,6 +290,9 @@ int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len,
         atomic_load_explicit(&h->seq, memory_order_acquire);
     if (s1 == s2 && (s2 & 1u) == 0u) {
       *out_len = (size_t)len;
+      if (copy_mode == 0) {
+        *buf = ctx->payload;
+      }
       return 0;
     }
     /* Concurrent write or writer restarted; retry for a stable snapshot. */

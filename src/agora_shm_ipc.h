@@ -111,15 +111,19 @@ int agora_shm_ipc_write(AgoraShmIpc *ctx, const void *data, size_t len,
                         const AgoraShmIpcFrameMeta *meta);
 
 /**
- * Reads the latest stable payload into buf.
+ * Reads the latest stable payload using a caller-owned indirection cell.
  *
+ * @param buf Must be non-NULL. If *buf is non-NULL, payload is copied into *buf
+ *            (cap must be >= data_len). If *buf is NULL, no copy is performed;
+ *            on success *buf is set to ctx->payload (view into the mmap).
+ * @param cap Maximum accepted data_len (ENOBUFS if data_len > cap).
  * @param out_hdr If non-NULL, filled with a snapshot of the SHM header (same
  *                stable snapshot as the payload; seq copied via atomic_load).
  * @return 0 on success, *out_len set. -1 with errno EAGAIN if no complete
  *         frame yet or concurrent write; ENOBUFS if cap < data_len; EINVAL /
  *         EIO for format issues.
  */
-int agora_shm_ipc_read(AgoraShmIpc *ctx, void *buf, size_t cap, size_t *out_len,
+int agora_shm_ipc_read(AgoraShmIpc *ctx, void **buf, size_t cap, size_t *out_len,
                        AgoraShmIpcHeader *out_hdr);
 
 #endif /* AGORA_SHM_IPC_H */

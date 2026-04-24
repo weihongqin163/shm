@@ -29,9 +29,11 @@ typedef void (*agora_shm_manager_on_frame_fn)(const char *shm_name,
  * localsock_max_clients / localsock_keepalive_ms are used only when
  * server_mode is true (passed to agora_localsock_server_create).
  *
- * max_read_cap: worker SHM read scratch size; 0 selects an implementation default.
+ * max_read_cap: maximum accepted SHM frame payload length for attach/dispatch;
+ *               0 selects an implementation default.
  *
- * @param hdr in on_frame is valid only until the callback returns.
+ * @note In on_frame, hdr and payload are valid only until the callback returns;
+ *       payload points into the SHM mmap.
  */
 int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t port,
                             bool server_mode, size_t localsock_max_clients,

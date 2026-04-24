@@ -56,7 +56,8 @@ int main(int argc, char **argv) {
     (void)usleep(2000);
     size_t out_len = 0u;
     AgoraShmIpcHeader hdr;
-    if (agora_shm_ipc_read(&ctx, buf, payload_size, &out_len, &hdr) != 0) {
+    void *read_dst = buf;
+    if (agora_shm_ipc_read(&ctx, &read_dst, payload_size, &out_len, &hdr) != 0) {
       if (errno != EAGAIN) {
         perror("agora_shm_ipc_read");
       }

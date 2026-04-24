@@ -54,7 +54,6 @@ struct AgoraShmManager {
   agora_shm_manager_on_frame_fn on_frame;
   void *user;
   size_t read_cap;
-  uint8_t *read_scratch;
   uint8_t *udp_recv;
 };
 
@@ -209,7 +208,8 @@ static void manager_dispatch_ipc_header(AgoraShmManager *m,
 
   size_t out_len = 0u;
   AgoraShmIpcHeader snap;
-  int rr = agora_shm_ipc_read(ipc, m->read_scratch, m->read_cap, &out_len, &snap);
+  void *payload_ref = NULL;
+  int rr = agora_shm_ipc_read(ipc, &payload_ref, m->read_cap, &out_len, &snap);
 
   char shm_name_cb[AGORA_SHM_IPC_SHM_NAME_BYTES];
   memcpy(shm_name_cb, e->shm_name, sizeof(shm_name_cb));
@@ -221,7 +221,7 @@ static void manager_dispatch_ipc_header(AgoraShmManager *m,
   pthread_mutex_unlock(&m->lock);
 
   if (rr == 0 && cb != NULL) {
-    cb(shm_name_cb, m->read_scratch, out_len, &snap, user);
+    cb(shm_name_cb, payload_ref, out_len, &snap, user);
   }
 }
 
@@ -413,11 +413,6 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
     return -1;
   }
 
-  m->read_scratch = (uint8_t *)malloc(cap);
-  if (m->read_scratch == NULL) {
-    free(m);
-    return -1;
-  }
   m->read_cap = cap;
   m->on_frame = on_frame;
   m->user = user;
@@ -427,7 +422,6 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
   if (!server_mode) {
     m->udp_recv = (uint8_t *)malloc(AGORA_SHM_MANAGER_UDP_CAP);
     if (m->udp_recv == NULL) {
-      free(m->read_scratch);
       free(m);
       return -1;
     }
@@ -436,7 +430,6 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
   if (pthread_mutex_init(&m->lock, NULL) != 0) {
     int e = errno;
     free(m->udp_recv);
-    free(m->read_scratch);
     free(m);
     errno = e;
     return -1;
@@ -448,7 +441,6 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
       int e = errno;
       (void)pthread_mutex_destroy(&m->lock);
       free(m->udp_recv);
-      free(m->read_scratch);
       free(m);
       errno = e;
       return -1;
@@ -460,7 +452,6 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
       m->srv = NULL;
       (void)pthread_mutex_destroy(&m->lock);
       free(m->udp_recv);
-      free(m->read_scratch);
       free(m);
       errno = e;
       return -1;
@@ -470,7 +461,6 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
       int e = errno;
       (void)pthread_mutex_destroy(&m->lock);
       free(m->udp_recv);
-      free(m->read_scratch);
       free(m);
       errno = e;
       return -1;
@@ -482,7 +472,6 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
       m->cli = NULL;
       (void)pthread_mutex_destroy(&m->lock);
       free(m->udp_recv);
-      free(m->read_scratch);
       free(m);
       errno = e;
       return -1;
@@ -540,8 +529,6 @@ void agora_shm_manager_close(AgoraShmManager *m) {
 
   free(m->udp_recv);
   m->udp_recv = NULL;
-  free(m->read_scratch);
-  m->read_scratch = NULL;
   free(m);
 }
 
