@@ -4,6 +4,8 @@
  * date: 2026-04-15
  */
 
+#define _POSIX_C_SOURCE 200809L
+
 #include "agora_shm_manager.h"
 
 #include "agora_localsock.h"
