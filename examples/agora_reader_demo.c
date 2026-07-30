@@ -4,6 +4,8 @@
  * date: 2026-04-15
  */
 
+#define _POSIX_C_SOURCE 200809L
+
 #include "agora_shm_ipc.h"
 
 #include <errno.h>
@@ -11,7 +13,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+
+static void sleep_ms(int ms) {
+  struct timespec ts;
+  ts.tv_sec = (time_t)(ms / 1000);
+  ts.tv_nsec = (long)((ms % 1000) * 1000000);
+  (void)nanosleep(&ts, NULL);
+}
 
 int main(int argc, char **argv) {
   (void)setvbuf(stdout, NULL, _IOLBF, 0);
@@ -40,7 +50,7 @@ int main(int argc, char **argv) {
       perror("agora_shm_ipc_open");
       return 1;
     }
-    (void)usleep(20000);
+    sleep_ms(20);
   }
 
   uint8_t *buf = (uint8_t *)malloc(payload_size);
@@ -53,7 +63,7 @@ int main(int argc, char **argv) {
   unsigned frame = 0u;
   unsigned last_seq = 0u;
   for (;;) {
-    (void)usleep(2000);
+    sleep_ms(2);
     size_t out_len = 0u;
     AgoraShmIpcHeader hdr;
     void *read_dst = buf;
