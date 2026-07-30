@@ -237,7 +237,7 @@ static void manager_dispatch_with_ps(AgoraShmManager *m, const char *shm_key,
   syn.magic = AGORA_SHM_IPC_MAGIC_EXPECT;
   syn.version = AGORA_SHM_IPC_VER_EXPECT;
   syn.payload_size = ps;
-  (void)strncpy(syn.shm_name, shm_key, sizeof(syn.shm_name) - 1u);
+  memcpy(syn.shm_name, shm_key, sizeof(syn.shm_name) - 1u);
   syn.shm_name[sizeof(syn.shm_name) - 1u] = '\0';
   manager_dispatch_ipc_header(m, &syn);
 }
