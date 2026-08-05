@@ -12,7 +12,7 @@
 #include <stdatomic.h>
 
 #define AGORA_SHM_IPC_USER_ID_BYTES 64u
-#define AGORA_SHM_IPC_SHM_NAME_BYTES 32u
+#define AGORA_SHM_IPC_SHM_NAME_BYTES 64u
 
 /** 0 = video, 1 = audio (stored as uint32_t in AgoraShmIpcHeader for stable layout). */
 typedef enum AgoraShmMediaType {

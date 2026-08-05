@@ -23,7 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define AGORA_SHM_MANAGER_MAX_ENTRIES 64
+#define AGORA_SHM_MANAGER_MAX_ENTRIES 256
 #define AGORA_SHM_MANAGER_DEFAULT_READ_CAP (256u * 1024u)
 #define AGORA_SHM_MANAGER_UDP_CAP 2048u
 
