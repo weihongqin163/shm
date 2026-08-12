@@ -27,7 +27,7 @@
 #define AGORA_SHM_MANAGER_MAX_ENTRIES 256
 #define AGORA_SHM_MANAGER_DEFAULT_READ_CAP (256u * 1024u)
 #define AGORA_SHM_MANAGER_UDP_CAP 2048u
-#define AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY (48u * 2u * 200u)
+#define AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY_IN_MS (60u)
 
 #define AGORA_SHM_IPC_MAGIC_EXPECT 0xA601C0DEu
 #define AGORA_SHM_IPC_VER_EXPECT 2u
@@ -145,14 +145,11 @@ static void manager_buffer_frame(AgoraShmManager *m,
   }
 
   if (e->media_type_valid == 0) {
-    size_t capacity =
-        media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO
-            ? (size_t)AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY
-            : m->read_cap;
+    size_t capacity = m->read_cap;
 
     // update to only 60ms for audio
     if (media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO) {
-      capacity = header->sample_rate * header->channels * header->bits / 8 * 60 / 1000;
+      capacity = header->sample_rate * header->channels * header->bits / 8 * AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY_IN_MS / 1000;
     } else {
       capacity = m->read_cap;
     }
