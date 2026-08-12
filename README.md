@@ -3,6 +3,40 @@
   copyright (c) 2026 Agora IO. All rights reserved.
   date: 2026-04-15
 -->
+# agora_shm的最佳实践
+一：头文件
+只需要关注： agora_shm_manager.h 中的5个api
+
+ 二、SHM 集成有几点可能注意下哈：
+1、udp 端口使用9877
+2、一个进程只有一个manager
+agora_shm_manager_start： 你用client 模式；agora用server模式
+read_cap = *1920*1080*3)/2
+
+agora_shm_manager_add：
+如果是视频，max_pay_size = (1920*1080*3)/2
+如果是音频，max_pay_size = (48000*1*2)/8
+3、shm 只支持 127，所以 docker 要使用 host 网络
+
+三、api 调用逻辑
+1、进程启动，agora_shm_manager_start
+注意用“二”中的参数
+
+2、当你收到AVCDialInReply的时候，取from XX里面的media ID作为shm_name参数，调用
+agora_shm_manager_add
+
+// write-read
+3、你有数据要通知agora的时候：agora_shm_manager_write
+4、当agora有数据达到，会自动callback 给你：agora_shm_manager_on_frame_fn
+注意：不要修改on_frame里面的内存值、不要释放、不要在callback中做耗时操作
+
+
+5、当Hang协议的时候，调用agora_shm_manager_remove
+注意：只移除你在三.2中加入的shm_name
+6、进程退出的时候：agora_shm_manager_close
+
+四、写入/读取数据大小的约定
+1、音频数据：需要是10ms的整数倍，不局限多少倍
 
 # agora_shm 用法说明
 
