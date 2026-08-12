@@ -32,13 +32,11 @@ struct agora_localsock_server {
   size_t max_clients;
   size_t n_clients;
   agora_localsock_slot *slots;
-  pthread_mutex_t io_mu;
 };
 
 struct agora_localsock_client {
   int fd;
   uint16_t server_port;
-  pthread_mutex_t mu;
 };
 
 static void client_peer_addr(const agora_localsock_client *c,
@@ -171,14 +169,10 @@ int agora_localsock_server_create(uint16_t port, uint32_t keepalive_interval_ms,
   if (s == NULL) {
     return -1;
   }
-  if (pthread_mutex_init(&s->io_mu, NULL) != 0) {
-    free(s);
-    return -1;
-  }
+
   s->slots =
       (agora_localsock_slot *)calloc(max_clients, sizeof(agora_localsock_slot));
   if (s->slots == NULL) {
-    pthread_mutex_destroy(&s->io_mu);
     free(s);
     return -1;
   }
@@ -190,7 +184,6 @@ int agora_localsock_server_create(uint16_t port, uint32_t keepalive_interval_ms,
   int fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) {
     free(s->slots);
-    pthread_mutex_destroy(&s->io_mu);
     free(s);
     return -1;
   }
@@ -199,7 +192,6 @@ int agora_localsock_server_create(uint16_t port, uint32_t keepalive_interval_ms,
     int e = errno;
     close(fd);
     free(s->slots);
-    pthread_mutex_destroy(&s->io_mu);
     free(s);
     errno = e;
     return -1;
@@ -209,7 +201,6 @@ int agora_localsock_server_create(uint16_t port, uint32_t keepalive_interval_ms,
     int e = errno;
     close(fd);
     free(s->slots);
-    pthread_mutex_destroy(&s->io_mu);
     free(s);
     errno = e;
     return -1;
@@ -221,7 +212,6 @@ int agora_localsock_server_create(uint16_t port, uint32_t keepalive_interval_ms,
   if (inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1) {
     close(fd);
     free(s->slots);
-    pthread_mutex_destroy(&s->io_mu);
     free(s);
     errno = EINVAL;
     return -1;
@@ -230,7 +220,6 @@ int agora_localsock_server_create(uint16_t port, uint32_t keepalive_interval_ms,
     int e = errno;
     close(fd);
     free(s->slots);
-    pthread_mutex_destroy(&s->io_mu);
     free(s);
     errno = e;
     return -1;
@@ -248,7 +237,6 @@ void agora_localsock_server_destroy(agora_localsock_server *s) {
     close(s->fd);
   }
   free(s->slots);
-  pthread_mutex_destroy(&s->io_mu);
   free(s);
 }
 
@@ -286,9 +274,7 @@ int agora_localsock_server_send_datagram(agora_localsock_server *s,
     memcpy(buf + AGORA_LOCALSOCK_HEADER_BYTES, payload, payload_len);
   }
 
-  pthread_mutex_lock(&s->io_mu);
   if (s->n_clients == 0u) {
-    pthread_mutex_unlock(&s->io_mu);
     free(buf);
     return 0;
   }
@@ -298,13 +284,11 @@ int agora_localsock_server_send_datagram(agora_localsock_server *s,
                (socklen_t)sizeof(s->slots[i].peer));
     if (nw != (ssize_t)total) {
       int e = errno;
-      pthread_mutex_unlock(&s->io_mu);
       free(buf);
       errno = (nw < 0) ? e : EIO;
       return -1;
     }
   }
-  pthread_mutex_unlock(&s->io_mu);
   free(buf);
   return 0;
 }
@@ -338,9 +322,7 @@ int agora_localsock_server_poll(agora_localsock_server *s, int timeout_ms,
       struct sockaddr_in peer;
       socklen_t plen = sizeof(peer);
       ssize_t nr = 0;
-      pthread_mutex_lock(&s->io_mu);
       nr = recvfrom(s->fd, recv_buf, cap, 0, (struct sockaddr *)&peer, &plen);
-      pthread_mutex_unlock(&s->io_mu);
       if (nr < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           break;
@@ -351,9 +333,7 @@ int agora_localsock_server_poll(agora_localsock_server *s, int timeout_ms,
         continue;
       }
       *out_len = (size_t)nr;
-      pthread_mutex_lock(&s->io_mu);
       (void)apply_datagram(s, recv_buf, nr, &peer, now_ns);
-      pthread_mutex_unlock(&s->io_mu);
       if (mono_now_ns(&now_ns) != 0) {
         return -1;
       }
@@ -363,9 +343,7 @@ int agora_localsock_server_poll(agora_localsock_server *s, int timeout_ms,
   if (mono_now_ns(&now_ns) != 0) {
     return -1;
   }
-  pthread_mutex_lock(&s->io_mu);
   evict_stale(s, now_ns);
-  pthread_mutex_unlock(&s->io_mu);
   return 0;
 }
 
@@ -391,14 +369,9 @@ int agora_localsock_client_create(uint16_t server_port,
     return -1;
   }
   c->fd = -1;
-  if (pthread_mutex_init(&c->mu, NULL) != 0) {
-    free(c);
-    return -1;
-  }
   int fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) {
     int e = errno;
-    pthread_mutex_destroy(&c->mu);
     free(c);
     errno = e;
     return -1;
@@ -417,7 +390,6 @@ void agora_localsock_client_destroy(agora_localsock_client *c) {
     close(c->fd);
     c->fd = -1;
   }
-  pthread_mutex_destroy(&c->mu);
   free(c);
 }
 
@@ -427,7 +399,6 @@ int agora_localsock_client_poll(agora_localsock_client *c, int timeout_ms,
     errno = EINVAL;
     return -1;
   }
-  pthread_mutex_lock(&c->mu);
   struct pollfd pfd;
   pfd.fd = c->fd;
   pfd.events = POLLIN;
@@ -435,17 +406,14 @@ int agora_localsock_client_poll(agora_localsock_client *c, int timeout_ms,
   int pr = poll(&pfd, 1u, timeout_ms);
   if (pr < 0) {
     int e = errno;
-    pthread_mutex_unlock(&c->mu);
     errno = e;
     return -1;
   }
   if (pr == 0) {
-    pthread_mutex_unlock(&c->mu);
     errno = EAGAIN;
     return -1;
   }
   if ((pfd.revents & (POLLERR | POLLNVAL)) != 0) {
-    pthread_mutex_unlock(&c->mu);
     errno = EIO;
     return -1;
   }
@@ -454,12 +422,10 @@ int agora_localsock_client_poll(agora_localsock_client *c, int timeout_ms,
   ssize_t nr = recvfrom(c->fd, buf, cap, 0, (struct sockaddr *)&src, &srclen);
   if (nr < 0) {
     int e = errno;
-    pthread_mutex_unlock(&c->mu);
     errno = e;
     return -1;
   }
   *out_len = (size_t)nr;
-  pthread_mutex_unlock(&c->mu);
   return 0;
 }
 
@@ -472,11 +438,9 @@ int agora_localsock_client_send_keepalive(agora_localsock_client *c) {
   (void)pack_keepalive(pkt);
   struct sockaddr_in peer;
   client_peer_addr(c, &peer);
-  pthread_mutex_lock(&c->mu);
   ssize_t nw =
       sendto(c->fd, pkt, sizeof(pkt), 0, (struct sockaddr *)&peer,
              (socklen_t)sizeof(peer));
-  pthread_mutex_unlock(&c->mu);
   if (nw != (ssize_t)sizeof(pkt)) {
     if (nw < 0) {
       return -1;
@@ -518,11 +482,9 @@ int agora_localsock_client_send_datagram(agora_localsock_client *c,
   }
   struct sockaddr_in peer;
   client_peer_addr(c, &peer);
-  pthread_mutex_lock(&c->mu);
   ssize_t nw =
       sendto(c->fd, buf, total, 0, (struct sockaddr *)&peer,
              (socklen_t)sizeof(peer));
-  pthread_mutex_unlock(&c->mu);
   free(buf);
   if (nw != (ssize_t)total) {
     if (nw < 0) {
