@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdalign.h>
 #include <stdatomic.h>
@@ -26,6 +27,7 @@
 #define AGORA_SHM_MANAGER_MAX_ENTRIES 256
 #define AGORA_SHM_MANAGER_DEFAULT_READ_CAP (256u * 1024u)
 #define AGORA_SHM_MANAGER_UDP_CAP 2048u
+#define AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY (48u * 2u * 200u)
 
 #define AGORA_SHM_IPC_MAGIC_EXPECT 0xA601C0DEu
 #define AGORA_SHM_IPC_VER_EXPECT 2u
@@ -35,6 +37,14 @@ typedef struct AgoraShmManagerReadEntry {
   int auto_read;
   char shm_name[AGORA_SHM_IPC_SHM_NAME_BYTES];
   AgoraShmIpc ipc;
+  uint32_t media_type;
+  int media_type_valid;
+  uint8_t *buffer;
+  size_t buffer_capacity;
+  size_t data_len;
+  unsigned latest_seq;
+  int latest_seq_valid;
+  AgoraShmIpcHeader latest_header;
 } AgoraShmManagerReadEntry;
 
 typedef struct AgoraShmManagerWriteEntry {
@@ -56,6 +66,7 @@ struct AgoraShmManager {
   agora_shm_manager_on_frame_fn on_frame;
   void *user;
   size_t read_cap;
+  uint8_t *read_scratch;
   uint8_t *udp_recv;
 };
 
@@ -91,7 +102,89 @@ static void clear_read_entry(AgoraShmManagerReadEntry *e) {
   if (e->in_use != 0) {
     agora_shm_ipc_close(&e->ipc);
   }
+  free(e->buffer);
   memset(e, 0, sizeof(*e));
+}
+
+static void manager_copy_header(AgoraShmIpcHeader *dst,
+                                const AgoraShmIpcHeader *src) {
+  dst->magic = src->magic;
+  dst->version = src->version;
+  dst->payload_size = src->payload_size;
+  dst->data_len = src->data_len;
+  memcpy(dst->shm_name, src->shm_name, sizeof(dst->shm_name));
+  memcpy(dst->user_id, src->user_id, sizeof(dst->user_id));
+  dst->media_type = src->media_type;
+  dst->stream_type = src->stream_type;
+  dst->width = src->width;
+  dst->height = src->height;
+  dst->sample_rate = src->sample_rate;
+  dst->channels = src->channels;
+  dst->bits = src->bits;
+  atomic_store_explicit(&dst->seq,
+                        atomic_load_explicit(&src->seq, memory_order_relaxed),
+                        memory_order_relaxed);
+}
+
+static void manager_buffer_frame(AgoraShmManager *m,
+                                 AgoraShmManagerReadEntry *e,
+                                 const void *payload, size_t len,
+                                 const AgoraShmIpcHeader *header) {
+  const uint32_t media_type = header->media_type;
+  if (media_type != (uint32_t)AGORA_SHM_MEDIA_AUDIO &&
+      media_type != (uint32_t)AGORA_SHM_MEDIA_VIDEO) {
+    return;
+  }
+  if (e->media_type_valid != 0 && e->media_type != media_type) {
+    return;
+  }
+
+  const unsigned seq = atomic_load_explicit(&header->seq, memory_order_relaxed);
+  if (e->latest_seq_valid != 0 && e->latest_seq == seq) {
+    return;
+  }
+
+  if (e->media_type_valid == 0) {
+    const size_t capacity =
+        media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO
+            ? (size_t)AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY
+            : m->read_cap;
+    uint8_t *buffer = (uint8_t *)malloc(capacity);
+    if (buffer == NULL) {
+      return;
+    }
+    e->buffer = buffer;
+    e->buffer_capacity = capacity;
+    e->media_type = media_type;
+    e->media_type_valid = 1;
+  }
+
+  if (media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO) {
+    if (len >= e->buffer_capacity) {
+      memcpy(e->buffer, (const uint8_t *)payload + len - e->buffer_capacity,
+             e->buffer_capacity);
+      e->data_len = e->buffer_capacity;
+    } else {
+      const size_t retained_capacity = e->buffer_capacity - len;
+      if (e->data_len > retained_capacity) {
+        const size_t discard = e->data_len - retained_capacity;
+        memmove(e->buffer, e->buffer + discard, e->data_len - discard);
+        e->data_len -= discard;
+      }
+      memcpy(e->buffer + e->data_len, payload, len);
+      e->data_len += len;
+    }
+  } else {
+    if (len > e->buffer_capacity) {
+      return;
+    }
+    memcpy(e->buffer, payload, len);
+    e->data_len = len;
+  }
+
+  manager_copy_header(&e->latest_header, header);
+  e->latest_seq = seq;
+  e->latest_seq_valid = 1;
 }
 
 static int find_write_entry_by_name(AgoraShmManager *m, const char *shm_name) {
@@ -120,7 +213,8 @@ static void clear_write_entry(AgoraShmManagerWriteEntry *e) {
   memset(e, 0, sizeof(*e));
 }
 
-static int manager_probe_shm_payload_size(const char *shm_name, uint32_t *out_ps) {
+static int manager_probe_shm_payload_size(const char *shm_name,
+                                          uint32_t *out_ps) {
   if (shm_name == NULL || out_ps == NULL) {
     errno = EINVAL;
     return -1;
@@ -138,7 +232,8 @@ static int manager_probe_shm_payload_size(const char *shm_name, uint32_t *out_ps
     return -1;
   }
   const AgoraShmIpcHeader *h = (const AgoraShmIpcHeader *)p;
-  if (h->magic != AGORA_SHM_IPC_MAGIC_EXPECT || h->version != AGORA_SHM_IPC_VER_EXPECT) {
+  if (h->magic != AGORA_SHM_IPC_MAGIC_EXPECT ||
+      h->version != AGORA_SHM_IPC_VER_EXPECT) {
     (void)munmap(p, map_len);
     (void)close(fd);
     errno = EIO;
@@ -210,15 +305,19 @@ static void manager_dispatch_ipc_header(AgoraShmManager *m,
 
   size_t out_len = 0u;
   AgoraShmIpcHeader snap;
-  void *payload_ref = NULL;
+  agora_shm_manager_on_frame_fn cb = m->on_frame;
+  void *payload_ref = cb == NULL ? m->read_scratch : NULL;
   int rr = agora_shm_ipc_read(ipc, &payload_ref, m->read_cap, &out_len, &snap);
 
   char shm_name_cb[AGORA_SHM_IPC_SHM_NAME_BYTES];
   memcpy(shm_name_cb, e->shm_name, sizeof(shm_name_cb));
   shm_name_cb[sizeof(shm_name_cb) - 1u] = '\0';
 
-  agora_shm_manager_on_frame_fn cb = m->on_frame;
   void *user = m->user;
+
+  if (rr == 0 && cb == NULL) {
+    manager_buffer_frame(m, e, payload_ref, out_len, &snap);
+  }
 
   pthread_mutex_unlock(&m->lock);
 
@@ -280,7 +379,8 @@ static void manager_on_udp_datagram(AgoraShmManager *m, const uint8_t *data,
   }
   agora_localsock_header lh;
   memcpy(&lh, data, sizeof(lh));
-  if (lh.magic != AGORA_LOCALSOCK_MAGIC || lh.ver != (uint16_t)AGORA_LOCALSOCK_VER) {
+  if (lh.magic != AGORA_LOCALSOCK_MAGIC ||
+      lh.ver != (uint16_t)AGORA_LOCALSOCK_VER) {
     return;
   }
   size_t total = (size_t)AGORA_LOCALSOCK_HEADER_BYTES + (size_t)lh.payload_len;
@@ -292,8 +392,10 @@ static void manager_on_udp_datagram(AgoraShmManager *m, const uint8_t *data,
     if (lh.payload_len != (uint32_t)sizeof(AgoraShmIpcHeader)) {
       return;
     }
-    alignas(AgoraShmIpcHeader) unsigned char hdr_storage[sizeof(AgoraShmIpcHeader)];
-    memcpy(hdr_storage, data + AGORA_LOCALSOCK_HEADER_BYTES, sizeof(hdr_storage));
+    alignas(
+        AgoraShmIpcHeader) unsigned char hdr_storage[sizeof(AgoraShmIpcHeader)];
+    memcpy(hdr_storage, data + AGORA_LOCALSOCK_HEADER_BYTES,
+           sizeof(hdr_storage));
     const AgoraShmIpcHeader *hdr = (const AgoraShmIpcHeader *)hdr_storage;
     manager_dispatch_ipc_header(m, hdr);
     return;
@@ -303,8 +405,10 @@ static void manager_on_udp_datagram(AgoraShmManager *m, const uint8_t *data,
     if (lh.payload_len != (uint32_t)sizeof(AgoraShmIpcFrameMeta)) {
       return;
     }
-    alignas(AgoraShmIpcFrameMeta) unsigned char meta_storage[sizeof(AgoraShmIpcFrameMeta)];
-    memcpy(meta_storage, data + AGORA_LOCALSOCK_HEADER_BYTES, sizeof(meta_storage));
+    alignas(AgoraShmIpcFrameMeta) unsigned char
+        meta_storage[sizeof(AgoraShmIpcFrameMeta)];
+    memcpy(meta_storage, data + AGORA_LOCALSOCK_HEADER_BYTES,
+           sizeof(meta_storage));
     const AgoraShmIpcFrameMeta *fm = (const AgoraShmIpcFrameMeta *)meta_storage;
     manager_dispatch_writecmd(m, fm);
   }
@@ -313,8 +417,7 @@ static void manager_on_udp_datagram(AgoraShmManager *m, const uint8_t *data,
 static void *agora_shm_manager_worker_server(void *arg) {
   AgoraShmManager *m = (AgoraShmManager *)arg;
 
-  uint8_t *srv_poll_buf =
-      (uint8_t *)malloc((size_t)AGORA_SHM_MANAGER_UDP_CAP);
+  uint8_t *srv_poll_buf = (uint8_t *)malloc((size_t)AGORA_SHM_MANAGER_UDP_CAP);
   if (srv_poll_buf == NULL) {
     return NULL;
   }
@@ -385,7 +488,7 @@ static void *agora_shm_manager_worker_client(void *arg) {
 
     size_t len = 0u;
     if (agora_localsock_client_poll(m->cli, 10, udp, AGORA_SHM_MANAGER_UDP_CAP,
-                                      &len) != 0) {
+                                    &len) != 0) {
       if (errno == EAGAIN || errno == EINTR) {
         continue;
       }
@@ -398,11 +501,12 @@ static void *agora_shm_manager_worker_client(void *arg) {
   return NULL;
 }
 
-int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t port,
-                            bool server_mode, size_t localsock_max_clients,
+int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
+                            uint16_t port, bool server_mode,
+                            size_t localsock_max_clients,
                             uint32_t localsock_keepalive_ms, void *user,
                             size_t max_read_cap, AgoraShmManager **out) {
-  if (on_frame == NULL || out == NULL || port == 0u) {
+  if (out == NULL || port == 0u) {
     errno = EINVAL;
     return -1;
   }
@@ -429,9 +533,18 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
   m->server_mode = server_mode;
   atomic_init(&m->stop, 0);
 
+  if (on_frame == NULL) {
+    m->read_scratch = (uint8_t *)malloc(cap);
+    if (m->read_scratch == NULL) {
+      free(m);
+      return -1;
+    }
+  }
+
   if (!server_mode) {
     m->udp_recv = (uint8_t *)malloc(AGORA_SHM_MANAGER_UDP_CAP);
     if (m->udp_recv == NULL) {
+      free(m->read_scratch);
       free(m);
       return -1;
     }
@@ -440,6 +553,7 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
   if (pthread_mutex_init(&m->lock, NULL) != 0) {
     int e = errno;
     free(m->udp_recv);
+    free(m->read_scratch);
     free(m);
     errno = e;
     return -1;
@@ -451,6 +565,7 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
       int e = errno;
       (void)pthread_mutex_destroy(&m->lock);
       free(m->udp_recv);
+      free(m->read_scratch);
       free(m);
       errno = e;
       return -1;
@@ -462,6 +577,7 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
       m->srv = NULL;
       (void)pthread_mutex_destroy(&m->lock);
       free(m->udp_recv);
+      free(m->read_scratch);
       free(m);
       errno = e;
       return -1;
@@ -471,6 +587,7 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
       int e = errno;
       (void)pthread_mutex_destroy(&m->lock);
       free(m->udp_recv);
+      free(m->read_scratch);
       free(m);
       errno = e;
       return -1;
@@ -482,6 +599,7 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t por
       m->cli = NULL;
       (void)pthread_mutex_destroy(&m->lock);
       free(m->udp_recv);
+      free(m->read_scratch);
       free(m);
       errno = e;
       return -1;
@@ -539,6 +657,8 @@ void agora_shm_manager_close(AgoraShmManager *m) {
 
   free(m->udp_recv);
   m->udp_recv = NULL;
+  free(m->read_scratch);
+  m->read_scratch = NULL;
   free(m);
 }
 
@@ -547,8 +667,9 @@ void agora_shm_manager_close(AgoraShmManager *m) {
  * Same duplicate rules as agora_shm_manager_add (EEXIST if name in write or
  * read table). Does not call writer_session_begin.
  */
-static int __attribute__((unused)) agora_shm_manager_addreader_inner(
-    AgoraShmManager *m, const char *shm_name, size_t max_payload_size) {
+static int __attribute__((unused))
+agora_shm_manager_addreader_inner(AgoraShmManager *m, const char *shm_name,
+                                  size_t max_payload_size) {
   if (m == NULL || shm_name == NULL || shm_name[0] == '\0' ||
       max_payload_size == 0u) {
     errno = EINVAL;
@@ -719,4 +840,69 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
 
   errno = EINVAL;
   return -1;
+}
+
+ssize_t agora_shm_manager_poll(AgoraShmManager *m, const char *shm_name,
+                               AgoraShmIpcHeader *header, char *out,
+                               size_t max_payload_size) {
+  if (m == NULL || shm_name == NULL || shm_name[0] == '\0' || header == NULL ||
+      out == NULL || max_payload_size == 0u) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  (void)pthread_mutex_lock(&m->lock);
+
+  if (m->on_frame != NULL) {
+    (void)pthread_mutex_unlock(&m->lock);
+    errno = ENOTSUP;
+    return -1;
+  }
+
+  int ridx = find_read_entry_by_name(m, shm_name);
+  if (ridx < 0) {
+    (void)pthread_mutex_unlock(&m->lock);
+    errno = ENOENT;
+    return -1;
+  }
+
+  AgoraShmManagerReadEntry *e = &m->read_entries[ridx];
+  if (e->data_len == 0u) {
+    (void)pthread_mutex_unlock(&m->lock);
+    return 0;
+  }
+
+  size_t copy_len = e->data_len;
+  if (e->media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO) {
+    if (copy_len > max_payload_size) {
+      copy_len = max_payload_size;
+    }
+  } else if (copy_len > max_payload_size) {
+    (void)pthread_mutex_unlock(&m->lock);
+    errno = ENOBUFS;
+    return -1;
+  }
+
+  if (copy_len > (size_t)SSIZE_MAX) {
+    (void)pthread_mutex_unlock(&m->lock);
+    errno = EOVERFLOW;
+    return -1;
+  }
+
+  memcpy(out, e->buffer, copy_len);
+  manager_copy_header(header, &e->latest_header);
+  header->data_len = (uint32_t)copy_len;
+
+  if (e->media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO) {
+    const size_t remaining = e->data_len - copy_len;
+    if (remaining > 0u) {
+      memmove(e->buffer, e->buffer + copy_len, remaining);
+    }
+    e->data_len = remaining;
+  } else {
+    e->data_len = 0u;
+  }
+
+  (void)pthread_mutex_unlock(&m->lock);
+  return (ssize_t)copy_len;
 }

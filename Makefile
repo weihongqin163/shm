@@ -20,8 +20,9 @@ AGORA_READER := $(BUILD_DIR)/agora_reader_demo
 AGORA_MANAGER_DEMO := $(BUILD_DIR)/agora_manager_demo
 AGORA_LOCALSOCK_OBJ := $(BUILD_DIR)/agora_localsock.o
 AGORA_LOCALSOCK_DEMO := $(BUILD_DIR)/agora_localsock_demo
+AGORA_MANAGER_POLL_TEST := $(BUILD_DIR)/test_agora_shm_manager_poll
 
-.PHONY: all clean
+.PHONY: all clean test
 
 all: $(AGORA_WRITER) $(AGORA_READER) $(AGORA_MANAGER_OBJ) $(AGORA_MANAGER_DEMO) $(AGORA_LOCALSOCK_DEMO)
 
@@ -48,6 +49,12 @@ $(AGORA_LOCALSOCK_OBJ): src/agora_localsock.c src/agora_localsock.h | $(BUILD_DI
 
 $(AGORA_LOCALSOCK_DEMO): examples/agora_localsock_demo.c $(AGORA_LOCALSOCK_OBJ) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ examples/agora_localsock_demo.c $(AGORA_LOCALSOCK_OBJ) $(LIBS)
+
+$(AGORA_MANAGER_POLL_TEST): tests/test_agora_shm_manager_poll.c $(AGORA_OBJ) $(AGORA_LOCALSOCK_OBJ) $(AGORA_MANAGER_OBJ) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ tests/test_agora_shm_manager_poll.c $(AGORA_OBJ) $(AGORA_LOCALSOCK_OBJ) $(AGORA_MANAGER_OBJ) $(LIBS)
+
+test: $(AGORA_MANAGER_POLL_TEST)
+	./$(AGORA_MANAGER_POLL_TEST)
 
 clean:
 	rm -rf $(BUILD_DIR)

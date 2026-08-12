@@ -71,11 +71,39 @@ make clean && make all
 
 ## agora_shm_manager（localsocket + SHM）
 
-- **职责**：`agora_shm_manager_start` 在 **127.0.0.1 UDP** 上以 **server**（绑定端口）或 **client**（`connect` 对端端口）运行 localsocket，并起 **一条** worker 线程：`server_poll` / `client_poll` 收到 **APP**（整帧 `AgoraShmIpcHeader`）或 **WRITECMD**（`AgoraShmIpcFrameMeta`）后，在读表中查找或 **自动附着读 SHM**，再 **`agora_shm_ipc_read`**（**`*buf == NULL`** 的零拷贝路径，见 `agora_shm_ipc.h`），释锁后调用 **`on_frame`**（**`hdr`** 与 **`payload`** 均与读接口快照 / mmap 一致；详见下文生命周期）。
-- **`max_read_cap`**：表示 worker 可接受的 **最大 SHM 帧 payload 长度**（用于附着与派发上限，`0` 为内置默认），**不再**表示内部分配的读 scratch 堆缓冲。
-- **表**：读表、写表各最多 **64** 槽。**`agora_shm_manager_add(shm_name, max_payload_size)`**：写端创建并登记。**`agora_shm_manager_remove`**：先写表后读表。**`agora_shm_manager_write`**：写表上 `agora_shm_ipc_write`，再发 **WRITECMD** 信令。写表已占用的 `shm_name` 不会同时为该名自动开读。
+- **职责**：`agora_shm_manager_start` 在 **127.0.0.1 UDP** 上以 **server**（绑定端口）或 **client**（`connect` 对端端口）运行 localsocket，并起 **一条** worker 线程。收到 **APP**（整帧 `AgoraShmIpcHeader`）或 **WRITECMD**（`AgoraShmIpcFrameMeta`）后，在读表中查找或 **自动附着读 SHM**，再读取稳定帧。
+- **接收模式**：`on_frame != NULL` 保持原来的零拷贝回调模式；`on_frame == NULL` 启用 `agora_shm_manager_poll` 模式。两种模式互斥，回调模式调用 poll 返回 `ENOTSUP`。
+- **`max_read_cap`**：worker 可接受的 **最大 SHM 帧 payload 长度**（`0` 为内置默认）。poll 模式还用它作为视频缓存和稳定读取 scratch 的容量；callback 模式不分配这些缓存。
+- **表**：读表、写表各最多 **256** 槽。**`agora_shm_manager_add(shm_name, max_payload_size)`**：写端创建并登记。**`agora_shm_manager_remove`**：先写表后读表。**`agora_shm_manager_write`**：写表上 `agora_shm_ipc_write`，再发 **WRITECMD** 信令。写表已占用的 `shm_name` 不会同时为该名自动开读。
 - **`agora_shm_manager_close`**：停止 worker；`close` 所有读/写 IPC；写槽若为 **`agora_shm_ipc_open(..., is_creator=1)`** 创建（`ipc.creator` 非零），在 close 后 **`agora_shm_ipc_unlink`**；再销毁 localsocket。
 - **设计细节**：[`PLAN_shm_ipc_manager.md`](PLAN_shm_ipc_manager.md)；localsocket 协议：[`PLAN_localsocket.md`](PLAN_localsocket.md)。
+
+### manager poll 模式
+
+启动时将 `on_frame` 传为 `NULL`，再用调用方分配的 `header` 和 `out` 接收数据：
+
+```c
+AgoraShmManager *manager = NULL;
+if (agora_shm_manager_start(NULL, port, true, max_clients, keepalive_ms, NULL,
+                            max_read_cap, &manager) != 0) {
+  /* handle errno */
+}
+
+AgoraShmIpcHeader header;
+char *out = malloc(max_read_cap);
+ssize_t n = agora_shm_manager_poll(manager, shm_name, &header, out,
+                                   max_read_cap);
+if (n > 0) {
+  /* out[0..n) is valid and header.data_len == (uint32_t)n */
+} else if (n < 0) {
+  /* handle errno */
+}
+```
+
+- 音频按到达顺序追加，最多保留最新 **200 ms（19200 字节）**；poll 可以分段取走数据，并将剩余数据前移。
+- 视频只保留最新完整帧；`out` 容量不足时返回 `-1/ENOBUFS`，该帧保留供扩大缓冲后重试。
+- 找到读条目但暂无缓存数据时返回 `0`，不修改 `header` 和 `out`；找不到 `shm_name` 时返回 `-1/ENOENT`。
+- 音频聚合时输出 header 来自最新接收帧；所有成功 poll 都将 `header.data_len` 改为本次返回字节数。
 
 ## agora_shm_ipc（核心）
 

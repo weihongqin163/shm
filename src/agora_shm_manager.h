@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 typedef struct AgoraShmManager AgoraShmManager;
 
@@ -21,7 +22,8 @@ typedef void (*agora_shm_manager_on_frame_fn)(const char *shm_name,
                                               void *user);
 
 /**
- * UDP on 127.0.0.1:port (localsocket). port must be non-zero (EINVAL otherwise).
+ * UDP on 127.0.0.1:port (localsocket). port must be non-zero (EINVAL
+ * otherwise).
  *
  * server_mode: true = bind UDP server on port; false = UDP client connect to
  * port.
@@ -29,21 +31,25 @@ typedef void (*agora_shm_manager_on_frame_fn)(const char *shm_name,
  * localsock_max_clients / localsock_keepalive_ms are used only when
  * server_mode is true (passed to agora_localsock_server_create).
  *
+ * on_frame: non-NULL selects callback mode; NULL selects poll mode.
+ *
  * max_read_cap: maximum accepted SHM frame payload length for attach/dispatch;
  *               0 selects an implementation default.
  *
  * @note In on_frame, hdr and payload are valid only until the callback returns;
  *       payload points into the SHM mmap.
  */
-int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame, uint16_t port,
-                            bool server_mode, size_t localsock_max_clients,
+int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
+                            uint16_t port, bool server_mode,
+                            size_t localsock_max_clients,
                             uint32_t localsock_keepalive_ms, void *user,
                             size_t max_read_cap, AgoraShmManager **out);
 
 /**
  * Stops the worker thread, agora_shm_ipc_close on all read/write entries; for
  * each write-table slot created via agora_shm_ipc_open(is_creator=1),
- * agora_shm_ipc_unlink after close; then destroys localsock and frees the manager.
+ * agora_shm_ipc_unlink after close; then destroys localsock and frees the
+ * manager.
  */
 void agora_shm_manager_close(AgoraShmManager *m);
 
@@ -72,5 +78,20 @@ int agora_shm_manager_remove(AgoraShmManager *m, const char *shm_name);
 int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
                             const void *data, size_t len,
                             const AgoraShmIpcFrameMeta *meta);
+
+/**
+ * Copies buffered receive data for shm_name into caller-owned storage.
+ *
+ * Available only when the manager was started with on_frame == NULL. Audio may
+ * be consumed partially; video is copied only when the complete frame fits.
+ * On a positive return, header is the latest accepted frame header with
+ * header->data_len set to the returned byte count.
+ *
+ * Returns copied bytes, 0 when the entry has no buffered data, or -1 with errno
+ * set to EINVAL, ENOTSUP, ENOENT, ENOBUFS, or EOVERFLOW as applicable.
+ */
+ssize_t agora_shm_manager_poll(AgoraShmManager *m, const char *shm_name,
+                               AgoraShmIpcHeader *header, char *out,
+                               size_t max_payload_size);
 
 #endif /* AGORA_SHM_MANAGER_H */
