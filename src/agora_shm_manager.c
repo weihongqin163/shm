@@ -384,7 +384,7 @@ static void *agora_shm_manager_worker_client(void *arg) {
     }
 
     size_t len = 0u;
-    if (agora_localsock_client_poll(m->cli, 100, udp, AGORA_SHM_MANAGER_UDP_CAP,
+    if (agora_localsock_client_poll(m->cli, 10, udp, AGORA_SHM_MANAGER_UDP_CAP,
                                       &len) != 0) {
       if (errno == EAGAIN || errno == EINTR) {
         continue;
