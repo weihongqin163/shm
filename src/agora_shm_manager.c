@@ -145,10 +145,17 @@ static void manager_buffer_frame(AgoraShmManager *m,
   }
 
   if (e->media_type_valid == 0) {
-    const size_t capacity =
+    size_t capacity =
         media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO
             ? (size_t)AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY
             : m->read_cap;
+
+    // update to only 60ms for audio
+    if (media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO) {
+      capacity = header->sample_rate * header->channels * header->bits / 8 * 60 / 1000;
+    } else {
+      capacity = m->read_cap;
+    }
     uint8_t *buffer = (uint8_t *)malloc(capacity);
     if (buffer == NULL) {
       return;
