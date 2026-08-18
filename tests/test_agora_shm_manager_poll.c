@@ -161,6 +161,7 @@ static AgoraShmIpcFrameMeta make_meta(const TestFixture *f,
     meta.sample_rate = 48000;
     meta.channels = 1;
     meta.bits = 16;
+    meta.orientation = 90;
   } else if (media_type == (uint32_t)AGORA_SHM_MEDIA_VIDEO) {
     meta.width = 16;
     meta.height = 16;
@@ -208,7 +209,8 @@ static int test_audio_append_and_header(void) {
   CHECK(n == (ssize_t)sizeof(out));
   CHECK(memcmp(out, first, sizeof(first)) == 0);
   CHECK(memcmp(out + sizeof(first), second, sizeof(second)) == 0);
-  CHECK(header.media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO);
+  CHECK(header.frame_meta.media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO);
+  CHECK(header.frame_meta.orientation == 90);
   CHECK(header.data_len == (uint32_t)sizeof(out));
   CHECK(atomic_load_explicit(&header.seq, memory_order_relaxed) == 4u);
   fixture_close(&f);
@@ -283,6 +285,7 @@ static int test_video_replaces_previous_frame(void) {
   CHECK(n == (ssize_t)sizeof(second));
   CHECK(memcmp(out, second, sizeof(second)) == 0);
   CHECK(header.data_len == (uint32_t)sizeof(second));
+  CHECK(header.frame_meta.orientation == 0);
   CHECK(atomic_load_explicit(&header.seq, memory_order_relaxed) == 4u);
   fixture_close(&f);
   return 0;
@@ -331,7 +334,7 @@ static int test_media_type_is_locked(void) {
   ssize_t n = wait_for_poll(&f, &header, out, sizeof(out));
   CHECK(n == (ssize_t)sizeof(audio));
   CHECK(memcmp(out, audio, sizeof(audio)) == 0);
-  CHECK(header.media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO);
+  CHECK(header.frame_meta.media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO);
   CHECK(atomic_load_explicit(&header.seq, memory_order_relaxed) == 2u);
   fixture_close(&f);
   return 0;

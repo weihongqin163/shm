@@ -42,8 +42,11 @@ static void on_frame(const char *shm_name, const void *payload, size_t len,
   }
   printf("[MANAGER] on_frame shm=%s len=%zu user_id=%.16s... media=%u stream=%u seq=%u "
          "wxh=%dx%d audio %d/%d/%d\n",
-         shm_name, len, hdr->user_id, hdr->media_type, hdr->stream_type, (unsigned)hdr->seq,
-         (int)hdr->width, (int)hdr->height, (int)hdr->sample_rate, (int)hdr->channels, (int)hdr->bits);
+         shm_name, len, hdr->frame_meta.user_id, hdr->frame_meta.media_type,
+         hdr->frame_meta.stream_type, (unsigned)hdr->seq,
+         (int)hdr->frame_meta.width, (int)hdr->frame_meta.height,
+         (int)hdr->frame_meta.sample_rate, (int)hdr->frame_meta.channels,
+         (int)hdr->frame_meta.bits);
 }
 
 int main(int argc, char **argv) {

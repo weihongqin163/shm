@@ -14,13 +14,13 @@
 #define AGORA_SHM_IPC_USER_ID_BYTES 64u
 #define AGORA_SHM_IPC_SHM_NAME_BYTES 64u
 
-/** 0 = video, 1 = audio (stored as uint32_t in AgoraShmIpcHeader for stable layout). */
+/** 0 = video, 1 = audio (stored as uint32_t in AgoraShmIpcFrameMeta for stable layout). */
 typedef enum AgoraShmMediaType {
   AGORA_SHM_MEDIA_VIDEO = 0,
   AGORA_SHM_MEDIA_AUDIO = 1,
 } AgoraShmMediaType;
 
-/** 0 = main, 1 = slides (stored as uint32_t in AgoraShmIpcHeader). */
+/** 0 = main, 1 = slides (stored as uint32_t in AgoraShmIpcFrameMeta). */
 typedef enum AgoraShmStreamType {
   AGORA_SHM_STREAM_MAIN = 0,
   AGORA_SHM_STREAM_SLIDES = 1,
@@ -32,7 +32,7 @@ typedef enum AgoraShmStreamType {
  */
 typedef struct AgoraShmIpcFrameMeta {
   char user_id[AGORA_SHM_IPC_USER_ID_BYTES];
-  /** Same layout as header->shm_name; NUL-terminated, max 31 chars + '\0'. */
+  /** NUL-terminated POSIX shm name, max 63 chars + '\0'. */
   char shm_name[AGORA_SHM_IPC_SHM_NAME_BYTES];
   uint32_t media_type;   /**< AgoraShmMediaType */
   uint32_t stream_type;  /**< AgoraShmStreamType */
@@ -41,6 +41,7 @@ typedef struct AgoraShmIpcFrameMeta {
   int32_t sample_rate;
   int32_t channels;
   int32_t bits;
+  int32_t orientation;
 } AgoraShmIpcFrameMeta;
 
 typedef struct AgoraShmIpcHeader {
@@ -48,16 +49,7 @@ typedef struct AgoraShmIpcHeader {
   uint32_t version;
   uint32_t payload_size;
   uint32_t data_len;
-  /** POSIX shm object name used at open; NUL-terminated, max 31 chars + '\0'. */
-  char shm_name[AGORA_SHM_IPC_SHM_NAME_BYTES];
-  char user_id[AGORA_SHM_IPC_USER_ID_BYTES];
-  uint32_t media_type;   /**< AgoraShmMediaType */
-  uint32_t stream_type;  /**< AgoraShmStreamType */
-  int32_t width;
-  int32_t height;
-  int32_t sample_rate;
-  int32_t channels;
-  int32_t bits;
+  AgoraShmIpcFrameMeta frame_meta;
   atomic_uint seq;
 } AgoraShmIpcHeader;
 
@@ -76,7 +68,7 @@ typedef struct AgoraShmIpc {
  *
  * @param shm_name      POSIX shm name (e.g. "/agsh1"); must start with '/' on
  *                      most systems; keep short on macOS. On success, copied
- *                      into header->shm_name (truncated to fit).
+ *                      into header->frame_meta.shm_name (truncated to fit).
  * @param payload_size  User payload bytes; total object size is
  *                      sizeof(AgoraShmIpcHeader) + payload_size.
  * @param is_creator    Non-zero: create with O_CREAT|O_EXCL, ftruncate, init

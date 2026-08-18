@@ -17,7 +17,7 @@
 #include <unistd.h>
 
 #define AGORA_SHM_IPC_MAGIC 0xA601C0DEu
-#define AGORA_SHM_IPC_VER 2u
+#define AGORA_SHM_IPC_VER 3u
 
 _Static_assert(sizeof(AgoraShmIpcHeader) <= 256, "header size bound");
 
@@ -26,33 +26,19 @@ static void agora_shm_ipc_header_set_shm_name(AgoraShmIpcHeader *h,
   if (h == NULL) {
     return;
   }
-  memset(h->shm_name, 0, sizeof(h->shm_name));
+  memset(h->frame_meta.shm_name, 0, sizeof(h->frame_meta.shm_name));
   if (shm_name != NULL) {
-    (void)strncpy(h->shm_name, shm_name, sizeof(h->shm_name) - 1u);
+    (void)strncpy(h->frame_meta.shm_name, shm_name,
+                  sizeof(h->frame_meta.shm_name) - 1u);
   }
 }
 
 static void agora_shm_ipc_header_apply_meta(AgoraShmIpcHeader *h,
                                            const AgoraShmIpcFrameMeta *meta) {
   if (meta != NULL) {
-    memcpy(h->user_id, meta->user_id, sizeof(h->user_id));
-    memcpy(h->shm_name, meta->shm_name, sizeof(h->shm_name));
-    h->media_type = meta->media_type;
-    h->stream_type = meta->stream_type;
-    h->width = meta->width;
-    h->height = meta->height;
-    h->sample_rate = meta->sample_rate;
-    h->channels = meta->channels;
-    h->bits = meta->bits;
+    h->frame_meta = *meta;
   } else {
-    memset(h->user_id, 0, sizeof(h->user_id));
-    h->media_type = 0u;
-    h->stream_type = 0u;
-    h->width = 0;
-    h->height = 0;
-    h->sample_rate = 0;
-    h->channels = 0;
-    h->bits = 0;
+    memset(&h->frame_meta, 0, sizeof(h->frame_meta));
   }
 }
 
@@ -62,15 +48,7 @@ static void agora_shm_ipc_copy_header_snapshot(AgoraShmIpcHeader *dst,
   dst->version = src->version;
   dst->payload_size = src->payload_size;
   dst->data_len = src->data_len;
-  memcpy(dst->shm_name, src->shm_name, sizeof(dst->shm_name));
-  memcpy(dst->user_id, src->user_id, sizeof(dst->user_id));
-  dst->media_type = src->media_type;
-  dst->stream_type = src->stream_type;
-  dst->width = src->width;
-  dst->height = src->height;
-  dst->sample_rate = src->sample_rate;
-  dst->channels = src->channels;
-  dst->bits = src->bits;
+  dst->frame_meta = src->frame_meta;
   atomic_store_explicit(
       &dst->seq,
       atomic_load_explicit(&src->seq, memory_order_relaxed),

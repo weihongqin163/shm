@@ -11,6 +11,17 @@
 
 （尚无条目。）
 
+## [1.0.7] - 2026-08-18
+
+### 破坏性 / IPC 布局
+
+- **`AgoraShmIpcHeader`**：移除直接暴露的帧元数据字段，改为内嵌 **`AgoraShmIpcFrameMeta frame_meta`**。调用方需将 `header->user_id`、`header->shm_name`、`header->media_type` 等访问更新为 `header->frame_meta.user_id`、`header->frame_meta.shm_name`、`header->frame_meta.media_type` 等。
+- **IPC 协议版本**：共享内存头版本从 **2** 升至 **3**；新代码拒绝旧版本的共享内存对象，重新集成时需重新创建共享内存。
+
+### 新增
+
+- **`AgoraShmIpcFrameMeta.orientation`**：新增固定宽度 `int32_t` 帧方向字段。零初始化元数据、新建共享内存及 writer session 重置时默认值均为 **0**；该字段随帧元数据在 seqlock 写入与稳定快照中完整传递。
+
 ## [1.0.1] - 2026-04-24
 
 ### 破坏性 / API

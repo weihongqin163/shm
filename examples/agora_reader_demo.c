@@ -82,9 +82,11 @@ int main(int argc, char **argv) {
 
     printf("reader seq=%u, frame=%u shm=%s user_id=%.16s... media=%u stream=%u "
            "wxh=%dx%d audio %d/%d/%d\n",
-           cur, frame, hdr.shm_name, hdr.user_id, hdr.media_type,
-           hdr.stream_type, (int)hdr.width, (int)hdr.height,
-           (int)hdr.sample_rate, (int)hdr.channels, (int)hdr.bits);
+           cur, frame, hdr.frame_meta.shm_name, hdr.frame_meta.user_id,
+           hdr.frame_meta.media_type, hdr.frame_meta.stream_type,
+           (int)hdr.frame_meta.width, (int)hdr.frame_meta.height,
+           (int)hdr.frame_meta.sample_rate, (int)hdr.frame_meta.channels,
+           (int)hdr.frame_meta.bits);
     ++frame;
   }
 

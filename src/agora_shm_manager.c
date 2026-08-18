@@ -30,7 +30,7 @@
 #define AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY_IN_MS (60u)
 
 #define AGORA_SHM_IPC_MAGIC_EXPECT 0xA601C0DEu
-#define AGORA_SHM_IPC_VER_EXPECT 2u
+#define AGORA_SHM_IPC_VER_EXPECT 3u
 
 typedef struct AgoraShmManagerReadEntry {
   int in_use;
@@ -112,15 +112,7 @@ static void manager_copy_header(AgoraShmIpcHeader *dst,
   dst->version = src->version;
   dst->payload_size = src->payload_size;
   dst->data_len = src->data_len;
-  memcpy(dst->shm_name, src->shm_name, sizeof(dst->shm_name));
-  memcpy(dst->user_id, src->user_id, sizeof(dst->user_id));
-  dst->media_type = src->media_type;
-  dst->stream_type = src->stream_type;
-  dst->width = src->width;
-  dst->height = src->height;
-  dst->sample_rate = src->sample_rate;
-  dst->channels = src->channels;
-  dst->bits = src->bits;
+  dst->frame_meta = src->frame_meta;
   atomic_store_explicit(&dst->seq,
                         atomic_load_explicit(&src->seq, memory_order_relaxed),
                         memory_order_relaxed);
@@ -130,7 +122,7 @@ static void manager_buffer_frame(AgoraShmManager *m,
                                  AgoraShmManagerReadEntry *e,
                                  const void *payload, size_t len,
                                  const AgoraShmIpcHeader *header) {
-  const uint32_t media_type = header->media_type;
+  const uint32_t media_type = header->frame_meta.media_type;
   if (media_type != (uint32_t)AGORA_SHM_MEDIA_AUDIO &&
       media_type != (uint32_t)AGORA_SHM_MEDIA_VIDEO) {
     return;
@@ -149,7 +141,9 @@ static void manager_buffer_frame(AgoraShmManager *m,
 
     // update to only 60ms for audio
     if (media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO) {
-      capacity = header->sample_rate * header->channels * header->bits / 8 * AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY_IN_MS / 1000;
+      capacity = header->frame_meta.sample_rate * header->frame_meta.channels *
+                 header->frame_meta.bits / 8 *
+                 AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY_IN_MS / 1000;
     } else {
       capacity = m->read_cap;
     }
@@ -262,7 +256,7 @@ static void manager_dispatch_ipc_header(AgoraShmManager *m,
   }
 
   char shm_key[AGORA_SHM_IPC_SHM_NAME_BYTES];
-  memcpy(shm_key, hdr->shm_name, sizeof(shm_key));
+  memcpy(shm_key, hdr->frame_meta.shm_name, sizeof(shm_key));
   shm_key[sizeof(shm_key) - 1u] = '\0';
   if (shm_key[0] == '\0') {
     return;
@@ -340,8 +334,9 @@ static void manager_dispatch_with_ps(AgoraShmManager *m, const char *shm_key,
   syn.magic = AGORA_SHM_IPC_MAGIC_EXPECT;
   syn.version = AGORA_SHM_IPC_VER_EXPECT;
   syn.payload_size = ps;
-  memcpy(syn.shm_name, shm_key, sizeof(syn.shm_name) - 1u);
-  syn.shm_name[sizeof(syn.shm_name) - 1u] = '\0';
+  memcpy(syn.frame_meta.shm_name, shm_key,
+         sizeof(syn.frame_meta.shm_name) - 1u);
+  syn.frame_meta.shm_name[sizeof(syn.frame_meta.shm_name) - 1u] = '\0';
   manager_dispatch_ipc_header(m, &syn);
 }
 
