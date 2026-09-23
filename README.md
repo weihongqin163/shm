@@ -140,6 +140,10 @@ volumes:
 
 `emptyDir` 会跨同一 Pod 内的容器崩溃和重启保留清单；Pod 被删除时数据随之删除。
 
+非 Pod 部署通常不需要额外挂载：只要 `/tmp` 可写，并且同一机器上的所有 manager 进程看到的是同一个 `/tmp`，即可直接使用。普通进程崩溃不会清除 `/tmp/agora_shm_manager`，后续启动的 manager 可以据此完成异常资源回收。
+
+如果根文件系统只读，则必须为 `/tmp/agora_shm_manager` 提供可写挂载。对于 Docker 等容器部署，如果只要求处理容器内进程崩溃，也不需要额外挂载；如果还要求容器被删除、重新创建后仍能读取旧清单并回收 SHM，则需要挂载宿主机目录或持久 volume，并确保所有协作 manager 共享该路径。
+
 ## 写端流程（API，仅 SHM）
 
 1. `agora_shm_ipc_open(shm_name, payload_size, /*is_creator=*/1, &ctx)`；若 `EEXIST` 可改为 `is_creator=0` 附着。
