@@ -27,12 +27,13 @@
 |------|------|------|
 | `magic` | `uint32_t` | 魔数，如 `0x4C4F4341`（`'LOCA'`） |
 | `ver` | `uint16_t` | 协议版本 `1` |
-| `msg_type` | `uint16_t` | `1` = keep-alive，`2` = APP 业务，`3` = WRITECMD（manager 写后信令，负载为 `AgoraShmIpcFrameMeta`） |
+| `msg_type` | `uint16_t` | `1` = keep-alive，`2` = APP 业务，`3` = WRITECMD，`4` = REMOVECMD |
 | `payload_len` | `uint32_t` | 紧跟其后的负载长度；keep-alive 可为 `0` |
 
 - **keep-alive**：`msg_type == 1`，`payload_len == 0`（总长度 = 固定头）。
 - **APP（2）**：业务负载由上层定义（如 manager 侧整头 `AgoraShmIpcHeader`）。
 - **WRITECMD（3）**：manager 写路径信令；负载为 **`AgoraShmIpcFrameMeta`**（见 `PLAN_shm_ipc_manager.md` 3.7）。
+- **REMOVECMD（4）**：manager 写槽释放信令；负载为固定 **`AGORA_SHM_IPC_SHM_NAME_BYTES`（64）字节**的 NUL 结尾 SHM 名称。接收 manager 只移除同名读槽，不移除写槽、不 unlink SHM。
 - **未知 `msg_type`（已定稿）**：若整包通过下文「包头完全合法」校验，对 **已在客户端表中** 的源地址 **仍刷新** `last_seen_mono`（视为对端仍存活）；**不**凭未知类型 **新建** 表项（新源须先发送已登记语义报文，如 keep-alive `msg_type==1`）。
 
 **待定**：是否要求客户端在 keep-alive 中带 **client_id**（UUID/自增）以便服务端在 ephemeral port 变化后合并逻辑会话——首版可仅用 **五元组中的源地址** 作为键（端口不变则稳定；端口重建则视为新客户端）。
@@ -150,6 +151,7 @@ int agora_localsock_client_poll(agora_localsock_client *c, int timeout_ms,
 | 包头类型公开 | **`agora_localsock_header` 在 `agora_localsock.h` 公开**（定稿 **3-B**） |
 | 客户端 keep-alive 驱动 | **默认**：业务层定时调用 `send_keepalive`；**嵌入 manager 的 client**：由 manager 线程 **每 500ms** 调用（见 manager PLAN） |
 | `magic`/`ver` 合法但 `msg_type` 未知 | 对已登记源 **仍刷新** `last_seen_mono`；对未登记源 **不新建**（问卷 **5-A**） |
+| REMOVECMD（4） | 与 WRITECMD 一样属于已知类型，可登记或刷新 peer |
 
 ---
 

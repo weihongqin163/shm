@@ -46,12 +46,13 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
 void agora_shm_manager_close(AgoraShmManager *m);
 
 /** 写表登记：`agora_shm_ipc_open(..., is_creator=1)` + `writer_session_begin`。
- *  max_payload_size 即 IPC payload_size，须非零（EINVAL）。写表/读表各最多 64 条；
+ *  max_payload_size 即 IPC payload_size，须非零（EINVAL）。写表/读表各最多 256 条；
  *  若 shm_name 已在写表或读（自动附着）表：EEXIST。表满：ENOMEM。 */
 int agora_shm_manager_add(AgoraShmManager *m, const char *shm_name,
                           size_t max_payload_size);
 
-/** 先写表按名移除并 close；否则读表；皆无则 ENOENT。 */
+/** 先写表按名发送 REMOVECMD、close、unlink 并删除清单记录；否则只移除
+ *  本地读表项；皆无则 ENOENT。 */
 int agora_shm_manager_remove(AgoraShmManager *m, const char *shm_name);
 
 /** 写表项上 `agora_shm_ipc_write`，再发 localsock WRITECMD（头 + `AgoraShmIpcFrameMeta`）。 */
@@ -95,15 +96,22 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
 
 ### 3.6 `agora_shm_manager_add` / `agora_shm_manager_remove`
 
-- **读表 / 写表**：内部 **`read_entries`**（UDP 自动附着读，最多 64）与 **`write_entries`**（`add` 登记的写端创建，最多 64）分离；**`close`** 时两套表项均 **`agora_shm_ipc_close`**。
-- **`add`**：`agora_shm_ipc_open(shm_name, max_payload_size, is_creator=1)` + **`agora_shm_ipc_writer_session_begin`**；`max_payload_size == 0` → `EINVAL`；写表或读表已存在同名 → **`EEXIST`**；写表满 → **`ENOMEM`**；其它失败透传 **`errno`**。
-- **`remove`**：先查写表移除并 close；否则查读表；两处都无 → **`ENOENT`**。
+- **读表 / 写表**：内部 **`read_entries`**（UDP 自动附着读，最多 256）与 **`write_entries`**（`add` 登记的写端创建，最多 256）分离；**`close`** 时两套表项均 **`agora_shm_ipc_close`**。
+- **`add`**：`agora_shm_ipc_open(shm_name, max_payload_size, is_creator=1)` + **`agora_shm_ipc_writer_session_begin`**，并在成功返回前把名称写入 `/tmp/agora_shm_manager` 下本 manager 的清单；`max_payload_size == 0` → `EINVAL`；写表或读表已存在同名 → **`EEXIST`**；写表满 → **`ENOMEM`**；其它失败透传 **`errno`**。
+- **`remove`**：先查写表；命中后发送 REMOVECMD、close、unlink 并删除清单记录。否则只从读表移除，不发送信令且不 unlink；两处都无 → **`ENOENT`**。
 - **UDP 派发**：若 `shm_name` 已在写表登记，**不再**为该名自动打开读附着（避免同 manager 内读写双持同一名的歧义）。
 
 ### 3.7 WRITECMD 与 `agora_shm_manager_write`
 
 - **`msg_type == AGORA_LOCALSOCK_MSG_WRITECMD`（3）**：UDP 负载为 **`sizeof(AgoraShmIpcFrameMeta)`** 的裸 meta；接收侧若读表尚无该 `shm_name`，则 **`shm_open` + `mmap` 头** 探测 **`payload_size`** 后再 **`agora_shm_ipc_open` 附着读** 并 **`agora_shm_ipc_read` / `on_frame`**（与 APP 头镜像路径等价信息）。
 - **`agora_shm_manager_write`**：仅在**写表**命中 `shm_name` 时 **`agora_shm_ipc_write`**；随后 **server** 调用 **`agora_localsock_server_send_datagram`** 向已登记 peer **广播** WRITECMD；**client** 调用 **`agora_localsock_client_send_datagram`**。无 peer 时 server 侧信令 **返回 0**（写已成功）。**`meta` 不可为 NULL**（`EINVAL`）。
+
+### 3.8 REMOVECMD 与异常退出恢复
+
+- **`msg_type == AGORA_LOCALSOCK_MSG_REMOVECMD`（4）**：UDP 负载为固定 64 字节 SHM 名称。接收侧严格校验长度和 NUL 结尾，只 close 并清空同名 `read_entry`；没有读槽时幂等忽略，绝不清理写槽或调用 `shm_unlink`。
+- **所有权**：谁调用 `agora_shm_manager_add` 创建写 SHM，谁负责在 remove/close 时发送 REMOVECMD 并 unlink。读侧只释放自己的映射。
+- **磁盘清单**：每个 manager 在 `/tmp/agora_shm_manager` 下拥有独立状态目录和 `flock` 锁。start 跳过仍锁定的活跃实例，对失锁清单逐项执行 `shm_unlink`；close 成功清理写 SHM 后删除自己的状态目录。
+- **多进程 / Pod**：同端口多个 client manager 通过独立目录隔离。Pod 多容器必须把同一个 `emptyDir` 挂载到 `/tmp/agora_shm_manager`，以便容器崩溃重启后仍能读取清单。
 
 ## 四、与旧版差异（摘要）
 
@@ -115,12 +123,12 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
 
 ## 五、并发与生命周期
 
-- **`agora_shm_manager_close`**：stop → **join** → 销毁 localsock → 关闭读表与写表全部 SHM 槽位 → `free`。
+- **`agora_shm_manager_close`**：stop → **join** → 对写槽发送 best-effort REMOVECMD → 关闭全部槽位并 unlink 创建方写 SHM → 销毁 localsock → 删除本 manager 状态目录 → `free`。
 - **禁止持锁**调用 `on_frame`。
 
 ## 六、依赖与构建
 
-- 链接：**`agora_shm_ipc.o`** + **`agora_localsock.o`** + **`pthread`**。
+- 链接：**`agora_shm_ipc.o`** + **`agora_localsock.o`** + **`agora_shm_manager_state.o`** + **`pthread`**。
 
 ## 七、图示
 

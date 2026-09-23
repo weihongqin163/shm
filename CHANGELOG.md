@@ -9,7 +9,15 @@
 
 ## [Unreleased]
 
-（尚无条目。）
+### 新增
+
+- **REMOVECMD（`msg_type == 4`）**：写槽 remove/close 时通知对端移除同名读槽；接收端不清理写槽，也不 unlink 非本端创建的 SHM。
+- **异常退出恢复**：成功 add 的写 SHM 名称持久化到 `/tmp/agora_shm_manager`。start 通过每 manager 独立 `flock` 区分活跃与失联实例，并回收失联实例遗留的 SHM；close 完成清理后删除自己的状态目录。
+- **Pod 部署规则**：多个进程或容器可共享状态根目录；Pod 应将同一个 `emptyDir` 挂载到 `/tmp/agora_shm_manager`。
+
+### 修正
+
+- poll 音频缓存测试与当前 **60ms** 实现保持一致。
 
 ## [1.0.7] - 2026-08-18
 

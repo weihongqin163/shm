@@ -54,7 +54,7 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
  * Stops the worker thread, agora_shm_ipc_close on all read/write entries; for
  * each write-table slot created via agora_shm_ipc_open(is_creator=1), sends a
  * best-effort REMOVECMD and calls agora_shm_ipc_unlink after close; removes the
- * manager's persistent state files after successful cleanup; then destroys
+ * manager's persistent state files after successful cleanup; destroys
  * localsock and frees the manager.
  */
 void agora_shm_manager_close(AgoraShmManager *m);

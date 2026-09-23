@@ -9,7 +9,7 @@
 
  二、SHM 集成有几点可能注意下哈：
 1、udp 端口使用9877
-2、一个进程只有一个manager
+2、同一进程或同一机器可启动多个 manager；每个 manager 使用独立的加锁状态目录
 agora_shm_manager_start： 你用client 模式；agora用server模式
 read_cap = *1920*1080*3)/2
 
@@ -62,7 +62,8 @@ make clean && make all
 |------|------|
 | `build/agora_shm_ipc.o` | SHM + seqlock 核心对象 |
 | `build/agora_localsock.o` | 127.0.0.1 UDP localsocket |
-| `build/agora_shm_manager.o` | manager 组合层（链 `agora_shm_ipc.o` + `agora_localsock.o` + `-pthread`） |
+| `build/agora_shm_manager_state.o` | manager 写 SHM 清单、文件锁与异常退出恢复 |
+| `build/agora_shm_manager.o` | manager 组合层（链 `agora_shm_ipc.o` + `agora_localsock.o` + `agora_shm_manager_state.o` + `-pthread`） |
 | `build/agora_writer_demo` / `build/agora_reader_demo` | 仅 **SHM** 的写/读示例（读端轮询，无独立 notify 模块） |
 | `build/agora_manager_demo` | **localsocket + manager**：端口、`server_mode`、localsock 参数、写 SHM 名（见下文） |
 | `build/agora_localsock_demo` | localsocket 最小 server/client 示例 |
@@ -71,11 +72,11 @@ make clean && make all
 
 ## agora_shm_manager（localsocket + SHM）
 
-- **职责**：`agora_shm_manager_start` 在 **127.0.0.1 UDP** 上以 **server**（绑定端口）或 **client**（`connect` 对端端口）运行 localsocket，并起 **一条** worker 线程。收到 **APP**（整帧 `AgoraShmIpcHeader`）或 **WRITECMD**（`AgoraShmIpcFrameMeta`）后，在读表中查找或 **自动附着读 SHM**，再读取稳定帧。
+- **职责**：`agora_shm_manager_start` 在 **127.0.0.1 UDP** 上以 **server**（绑定端口）或 **client**（`connect` 对端端口）运行 localsocket，并起 **一条** worker 线程。收到 **APP**（整帧 `AgoraShmIpcHeader`）或 **WRITECMD**（`AgoraShmIpcFrameMeta`）后，在读表中查找或 **自动附着读 SHM**，再读取稳定帧；收到 **REMOVECMD** 后只关闭并移除同名读槽。
 - **接收模式**：`on_frame != NULL` 保持原来的零拷贝回调模式；`on_frame == NULL` 启用 `agora_shm_manager_poll` 模式。两种模式互斥，回调模式调用 poll 返回 `ENOTSUP`。
 - **`max_read_cap`**：worker 可接受的 **最大 SHM 帧 payload 长度**（`0` 为内置默认）。poll 模式还用它作为视频缓存和稳定读取 scratch 的容量；callback 模式不分配这些缓存。
-- **表**：读表、写表各最多 **256** 槽。**`agora_shm_manager_add(shm_name, max_payload_size)`**：写端创建并登记。**`agora_shm_manager_remove`**：先写表后读表。**`agora_shm_manager_write`**：写表上 `agora_shm_ipc_write`，再发 **WRITECMD** 信令。写表已占用的 `shm_name` 不会同时为该名自动开读。
-- **`agora_shm_manager_close`**：停止 worker；`close` 所有读/写 IPC；写槽若为 **`agora_shm_ipc_open(..., is_creator=1)`** 创建（`ipc.creator` 非零），在 close 后 **`agora_shm_ipc_unlink`**；再销毁 localsocket。
+- **表与所有权**：读表、写表各最多 **256** 槽。**`agora_shm_manager_add(shm_name, max_payload_size)`** 创建写 SHM 并把名称持久化。**`agora_shm_manager_remove`** 命中写槽时发送 **REMOVECMD**、关闭并 unlink SHM、删除清单记录；命中读槽时只清理本地读槽。写表已占用的 `shm_name` 不会同时为该名自动开读。
+- **`agora_shm_manager_close`**：停止 worker；对写槽发送 best-effort **REMOVECMD**，关闭全部读/写 IPC 并 unlink 创建方写 SHM；销毁 localsocket，成功清理后删除本 manager 的磁盘状态目录。
 - **设计细节**：[`PLAN_shm_ipc_manager.md`](PLAN_shm_ipc_manager.md)；localsocket 协议：[`PLAN_localsocket.md`](PLAN_localsocket.md)。
 
 ### manager poll 模式
@@ -100,7 +101,7 @@ if (n > 0) {
 }
 ```
 
-- 音频按到达顺序追加，最多保留最新 **200 ms（19200 字节）**；poll 可以分段取走数据，并将剩余数据前移。
+- 音频按到达顺序追加，最多保留最新 **60 ms**（容量按帧元数据中的采样率、声道数和位深计算）；poll 可以分段取走数据，并将剩余数据前移。
 - 视频只保留最新完整帧；`out` 容量不足时返回 `-1/ENOBUFS`，该帧保留供扩大缓冲后重试。
 - 找到读条目但暂无缓存数据时返回 `0`，不修改 `header` 和 `out`；找不到 `shm_name` 时返回 `-1/ENOENT`。
 - 音频聚合时输出 header 来自最新接收帧；所有成功 poll 都将 `header.data_len` 改为本次返回字节数。
@@ -119,7 +120,25 @@ if (n > 0) {
 
 - **APP UDP**：`msg_type == 2`，payload 为 **`sizeof(AgoraShmIpcHeader)`** 的裸头（用于携带头快照以便对端附着/读 SHM）。
 - **WRITECMD**：`msg_type == 3`，payload 为 **`AgoraShmIpcFrameMeta`**；对端若无读表项，会 **probe** SHM 头得到 **`payload_size`** 再附着读。
+- **REMOVECMD**：`msg_type == 4`，payload 为固定 **64 字节 SHM 名称**；只有写槽所有者发送，对端只移除同名读槽且不执行 unlink。
 - **生命周期**：`on_frame` 里的 **`const AgoraShmIpcHeader *hdr`** 与 **`const void *payload`** 仅在回调返回前有效；**`payload` 指向 SHM 映射区**，跨异步长期持有须先在回调内 **memcpy** 到自有缓冲。
+
+### manager 异常退出恢复与 Pod 部署
+
+- 状态根目录固定为 **`/tmp/agora_shm_manager`**。每个 manager 使用独立子目录、`flock` 独占锁和 `shm.list`；`add` 成功返回前写入名称，`remove` 成功 unlink 后删除名称。
+- `agora_shm_manager_start` 扫描状态目录：仍被锁定的目录属于活跃 manager，必须跳过；可获得锁的目录属于异常退出实例，按清单幂等执行 `shm_unlink` 后删除。
+- 普通 Linux 可直接使用该路径。Kubernetes 生产部署必须把共享 `emptyDir` 挂载到该路径；同一 Pod 内所有协作容器使用同一个 volume，`readOnlyRootFilesystem: true` 时也必须提供此可写挂载：
+
+```yaml
+volumeMounts:
+  - name: shm-manager-state
+    mountPath: /tmp/agora_shm_manager
+volumes:
+  - name: shm-manager-state
+    emptyDir: {}
+```
+
+`emptyDir` 会跨同一 Pod 内的容器崩溃和重启保留清单；Pod 被删除时数据随之删除。
 
 ## 写端流程（API，仅 SHM）
 
@@ -177,7 +196,7 @@ if (n > 0) {
 | `max_clients` / `keepalive_ms` | 仅 **server** 模式传给 `agora_localsock_server_create`（client 模式仍须填合法正数） |
 | `write_shm_name` | **server_mode=1** 时：本进程创建/附着写 SHM，并用 localsock **client** 向本机 `port` 发 **APP**（整头）唤醒 manager |
 
-**server_mode=1** 时：进程内同时有 **manager（UDP server）** 与 **localsock client** 发信令，无需第二进程即可联调。`payload_size` 在 demo 内固定为 **4096**；退出 **Ctrl+C**。异常退出后可 **`shm_unlink`** 各自 `write_shm_name`。
+**server_mode=1** 时：进程内同时有 **manager（UDP server）** 与 **localsock client** 发信令，无需第二进程即可联调。`payload_size` 在 demo 内固定为 **4096**；退出 **Ctrl+C**。manager 正常退出会 unlink 自己创建的写 SHM；异常退出遗留对象由下一次 manager start 根据磁盘清单恢复。
 
 ### localsocket 最小示例 `agora_localsock_demo`
 
