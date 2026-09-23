@@ -16,7 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define AUDIO_BUFFER_CAPACITY (48u * 2u * 200u)
+#define AUDIO_BUFFER_CAPACITY (48000u * 1u * 16u / 8u * 60u / 1000u)
 #define TEST_READ_CAP 32768u
 
 #define CHECK(cond)                                                            \
@@ -217,7 +217,7 @@ static int test_audio_append_and_header(void) {
   return 0;
 }
 
-static int test_audio_keeps_latest_200ms(void) {
+static int test_audio_keeps_latest_60ms(void) {
   TestFixture f;
   CHECK(fixture_open(&f, 12000u) == 0);
   uint8_t *first = (uint8_t *)malloc(12000u);
@@ -232,10 +232,7 @@ static int test_audio_keeps_latest_200ms(void) {
   AgoraShmIpcHeader header;
   ssize_t n = wait_for_poll(&f, &header, out, AUDIO_BUFFER_CAPACITY);
   CHECK(n == (ssize_t)AUDIO_BUFFER_CAPACITY);
-  for (size_t i = 0u; i < 7200u; ++i) {
-    CHECK((unsigned char)out[i] == 0x31u);
-  }
-  for (size_t i = 7200u; i < AUDIO_BUFFER_CAPACITY; ++i) {
+  for (size_t i = 0u; i < AUDIO_BUFFER_CAPACITY; ++i) {
     CHECK((unsigned char)out[i] == 0x42u);
   }
   CHECK(header.data_len == AUDIO_BUFFER_CAPACITY);
@@ -246,7 +243,7 @@ static int test_audio_keeps_latest_200ms(void) {
   return 0;
 }
 
-static int test_single_audio_block_keeps_latest_200ms(void) {
+static int test_single_audio_block_keeps_latest_60ms(void) {
   TestFixture f;
   CHECK(fixture_open(&f, 24000u) == 0);
   uint8_t *data = (uint8_t *)malloc(24000u);
@@ -593,8 +590,8 @@ static int test_poll_frames_are_stable_under_concurrent_writes(void) {
 int main(void) {
   CHECK(test_poll_errors_and_empty_entry() == 0);
   CHECK(test_audio_append_and_header() == 0);
-  CHECK(test_audio_keeps_latest_200ms() == 0);
-  CHECK(test_single_audio_block_keeps_latest_200ms() == 0);
+  CHECK(test_audio_keeps_latest_60ms() == 0);
+  CHECK(test_single_audio_block_keeps_latest_60ms() == 0);
   CHECK(test_partial_audio_poll_moves_remainder() == 0);
   CHECK(test_video_replaces_previous_frame() == 0);
   CHECK(test_video_enobufs_preserves_frame() == 0);
