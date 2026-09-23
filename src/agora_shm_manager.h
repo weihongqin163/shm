@@ -38,6 +38,11 @@ typedef void (*agora_shm_manager_on_frame_fn)(const char *shm_name,
  *
  * @note In on_frame, hdr and payload are valid only until the callback returns;
  *       payload points into the SHM mmap.
+ *
+ * Before creating the worker, start recovers creator-owned SHM objects left in
+ * unlocked state directories by abnormally terminated managers. Live managers
+ * retain an exclusive state-file lock and are never recovered by another
+ * manager.
  */
 int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
                             uint16_t port, bool server_mode,
@@ -47,9 +52,10 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
 
 /**
  * Stops the worker thread, agora_shm_ipc_close on all read/write entries; for
- * each write-table slot created via agora_shm_ipc_open(is_creator=1),
- * agora_shm_ipc_unlink after close; then destroys localsock and frees the
- * manager.
+ * each write-table slot created via agora_shm_ipc_open(is_creator=1), sends a
+ * best-effort REMOVECMD and calls agora_shm_ipc_unlink after close; removes the
+ * manager's persistent state files after successful cleanup; then destroys
+ * localsock and frees the manager.
  */
 void agora_shm_manager_close(AgoraShmManager *m);
 
@@ -64,8 +70,12 @@ int agora_shm_manager_add(AgoraShmManager *m, const char *shm_name,
                           size_t max_payload_size);
 
 /**
- * Removes shm_name from the write table first; if not found, removes from the
- * read (auto-attach) table. Returns -1 with errno ENOENT if absent in both.
+ * Removes shm_name from the write table first. A write removal sends REMOVECMD,
+ * closes and unlinks the creator-owned SHM, then removes its persistent state
+ * record. If not found in the write table, removes only the local read entry;
+ * read removal never sends REMOVECMD or unlinks SHM. Returns -1 with errno
+ * ENOENT if absent in both. Local write cleanup still runs if notification
+ * fails, and the first notification or cleanup error is returned.
  */
 int agora_shm_manager_remove(AgoraShmManager *m, const char *shm_name);
 

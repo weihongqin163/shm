@@ -171,6 +171,53 @@ static int test_dead_owner_is_recovered(void) {
   return 0;
 }
 
+static int test_live_manager_is_not_recovered_across_processes(void) {
+  char root[] = "/tmp/agora_shm_state_test_XXXXXX";
+  char shm_name[AGORA_SHM_IPC_SHM_NAME_BYTES];
+  int ready_pipe[2];
+  int release_pipe[2];
+  make_shm_name(shm_name, sizeof(shm_name), "process");
+  CHECK(mkdtemp(root) != NULL);
+  CHECK(create_test_shm(shm_name) == 0);
+  CHECK(pipe(ready_pipe) == 0);
+  CHECK(pipe(release_pipe) == 0);
+
+  pid_t child = fork();
+  CHECK(child >= 0);
+  if (child == 0) {
+    (void)close(ready_pipe[0]);
+    (void)close(release_pipe[1]);
+    AgoraShmManagerState live;
+    char byte = '1';
+    if (agora_shm_manager_state_open_at(&live, root) != 0 ||
+        agora_shm_manager_state_add(&live, shm_name) != 0 ||
+        write(ready_pipe[1], &byte, 1u) != 1 ||
+        read(release_pipe[0], &byte, 1u) != 1 ||
+        agora_shm_manager_state_remove(&live, shm_name) != 0) {
+      _exit(2);
+    }
+    agora_shm_manager_state_close(&live);
+    _exit(0);
+  }
+
+  (void)close(ready_pipe[1]);
+  (void)close(release_pipe[0]);
+  char byte = 0;
+  CHECK(read(ready_pipe[0], &byte, 1u) == 1);
+  AgoraShmManagerState second;
+  CHECK(agora_shm_manager_state_open_at(&second, root) == 0);
+  CHECK(shm_exists(shm_name) == 1);
+  agora_shm_manager_state_close(&second);
+  CHECK(write(release_pipe[1], "1", 1u) == 1);
+  CHECK(wait_child_ok(child) == 0);
+  (void)close(ready_pipe[0]);
+  (void)close(release_pipe[1]);
+  CHECK(shm_exists(shm_name) == 1);
+  CHECK(agora_shm_ipc_unlink(shm_name) == 0);
+  CHECK(rmdir(root) == 0);
+  return 0;
+}
+
 static int test_malformed_manifest_fails_without_unlinking(void) {
   char root[] = "/tmp/agora_shm_state_test_XXXXXX";
   char unrelated[AGORA_SHM_IPC_SHM_NAME_BYTES];
@@ -206,6 +253,7 @@ int main(void) {
   CHECK(test_add_remove_and_close_manifest() == 0);
   CHECK(test_live_manager_is_not_recovered_in_same_process() == 0);
   CHECK(test_dead_owner_is_recovered() == 0);
+  CHECK(test_live_manager_is_not_recovered_across_processes() == 0);
   CHECK(test_malformed_manifest_fails_without_unlinking() == 0);
   puts("PASS test_agora_shm_manager_state");
   return 0;

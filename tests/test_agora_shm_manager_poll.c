@@ -2,9 +2,12 @@
 
 #include "agora_localsock.h"
 #include "agora_shm_manager.h"
+#include "agora_shm_manager_state.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -12,7 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -207,6 +212,68 @@ static int wait_for_missing_read_entry(AgoraShmManager *manager,
   }
   errno = ETIMEDOUT;
   return -1;
+}
+
+static int count_manifests_containing(const char *shm_name) {
+  DIR *root = opendir(AGORA_SHM_MANAGER_STATE_ROOT);
+  if (root == NULL) {
+    return errno == ENOENT ? 0 : -1;
+  }
+  int count = 0;
+  struct dirent *entry;
+  while ((entry = readdir(root)) != NULL) {
+    if (strncmp(entry->d_name, "manager-", 8u) != 0) {
+      continue;
+    }
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s/shm.list",
+                     AGORA_SHM_MANAGER_STATE_ROOT, entry->d_name);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+      (void)closedir(root);
+      errno = ENAMETOOLONG;
+      return -1;
+    }
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) {
+      continue;
+    }
+    char line[AGORA_SHM_IPC_SHM_NAME_BYTES + 2u];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+      line[strcspn(line, "\n")] = '\0';
+      if (strcmp(line, shm_name) == 0) {
+        ++count;
+        break;
+      }
+    }
+    (void)fclose(fp);
+  }
+  (void)closedir(root);
+  return count;
+}
+
+static int count_manager_state_dirs(void) {
+  DIR *root = opendir(AGORA_SHM_MANAGER_STATE_ROOT);
+  if (root == NULL) {
+    return errno == ENOENT ? 0 : -1;
+  }
+  int count = 0;
+  struct dirent *entry;
+  while ((entry = readdir(root)) != NULL) {
+    if (strncmp(entry->d_name, "manager-", 8u) == 0) {
+      ++count;
+    }
+  }
+  (void)closedir(root);
+  return count;
+}
+
+static int shm_exists(const char *shm_name) {
+  int fd = shm_open(shm_name, O_RDWR, 0);
+  if (fd >= 0) {
+    (void)close(fd);
+    return 1;
+  }
+  return 0;
 }
 
 static int test_audio_append_and_header(void) {
@@ -513,6 +580,7 @@ static int test_remove_discards_poll_entry(void) {
   AgoraShmIpcHeader header;
   CHECK(wait_for_poll(&f, &header, out, sizeof(out)) == (ssize_t)sizeof(out));
   CHECK(agora_shm_manager_remove(f.receiver, f.shm_name) == 0);
+  CHECK(shm_exists(f.shm_name) == 1);
   errno = 0;
   CHECK(poll_api(f.receiver, f.shm_name, &header, out, sizeof(out)) == -1);
   CHECK(errno == ENOENT);
@@ -568,6 +636,71 @@ static int test_removecmd_does_not_remove_write_entry(void) {
   agora_localsock_client_destroy(signal_client);
   agora_shm_manager_close(owner);
   (void)agora_shm_ipc_unlink(shm_name);
+  return 0;
+}
+
+static int test_add_and_remove_update_persistent_manifest(void) {
+  TestFixture f;
+  CHECK(fixture_open(&f, 1024u) == 0);
+  CHECK(count_manifests_containing(f.shm_name) == 1);
+  CHECK(agora_shm_manager_remove(f.writer, f.shm_name) == 0);
+  CHECK(count_manifests_containing(f.shm_name) == 0);
+  fixture_close(&f);
+  return 0;
+}
+
+static int test_start_recovers_abandoned_manager_shm(void) {
+  uint16_t port = reserve_udp_port();
+  CHECK(port != 0u);
+  char shm_name[AGORA_SHM_IPC_SHM_NAME_BYTES];
+  (void)snprintf(shm_name, sizeof(shm_name), "/arecov_%ld_%u", (long)getpid(),
+                 ++g_name_counter);
+  (void)agora_shm_ipc_unlink(shm_name);
+
+  pid_t child = fork();
+  CHECK(child >= 0);
+  if (child == 0) {
+    AgoraShmManager *abandoned = NULL;
+    if (agora_shm_manager_start(noop_frame, port, false, 0u, 0u, NULL,
+                                TEST_READ_CAP, &abandoned) != 0 ||
+        agora_shm_manager_add(abandoned, shm_name, 1024u) != 0) {
+      _exit(2);
+    }
+    _exit(0);
+  }
+
+  int status = 0;
+  CHECK(waitpid(child, &status, 0) == child);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  CHECK(shm_exists(shm_name) == 1);
+
+  AgoraShmManager *recovery = NULL;
+  CHECK(agora_shm_manager_start(noop_frame, port, false, 0u, 0u, NULL,
+                                TEST_READ_CAP, &recovery) == 0);
+  CHECK(shm_exists(shm_name) == 0);
+  agora_shm_manager_close(recovery);
+  return 0;
+}
+
+static int test_close_removes_state_and_detaches_peer(void) {
+  int dirs_before = count_manager_state_dirs();
+  CHECK(dirs_before >= 0);
+
+  TestFixture f;
+  CHECK(fixture_open(&f, 1024u) == 0);
+  CHECK(count_manager_state_dirs() == dirs_before + 2);
+  uint8_t data[16] = {0};
+  CHECK(write_frame(&f, data, sizeof(data), AGORA_SHM_MEDIA_VIDEO) == 0);
+  AgoraShmIpcHeader header;
+  char out[sizeof(data)];
+  CHECK(wait_for_poll(&f, &header, out, sizeof(out)) == (ssize_t)sizeof(out));
+
+  agora_shm_manager_close(f.writer);
+  f.writer = NULL;
+  CHECK(wait_for_missing_read_entry(f.receiver, f.shm_name) == 0);
+  CHECK(count_manager_state_dirs() == dirs_before + 1);
+  fixture_close(&f);
+  CHECK(count_manager_state_dirs() == dirs_before);
   return 0;
 }
 
@@ -668,6 +801,9 @@ int main(void) {
   CHECK(test_remove_discards_poll_entry() == 0);
   CHECK(test_writer_remove_detaches_peer_read_entry() == 0);
   CHECK(test_removecmd_does_not_remove_write_entry() == 0);
+  CHECK(test_add_and_remove_update_persistent_manifest() == 0);
+  CHECK(test_start_recovers_abandoned_manager_shm() == 0);
+  CHECK(test_close_removes_state_and_detaches_peer() == 0);
   CHECK(test_poll_frames_are_stable_under_concurrent_writes() == 0);
   puts("PASS test_agora_shm_manager_poll");
   return 0;
