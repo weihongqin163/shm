@@ -249,12 +249,29 @@ static int test_malformed_manifest_fails_without_unlinking(void) {
   return 0;
 }
 
+static int test_directory_already_being_removed_is_ignored(void) {
+  char root[] = "/tmp/agora_shm_state_test_XXXXXX";
+  char closing_dir[PATH_MAX];
+  CHECK(mkdtemp(root) != NULL);
+  CHECK(snprintf(closing_dir, sizeof(closing_dir), "%s/manager-closing", root) >
+        0);
+  CHECK(mkdir(closing_dir, 0700) == 0);
+
+  AgoraShmManagerState state;
+  CHECK(agora_shm_manager_state_open_at(&state, root) == 0);
+  agora_shm_manager_state_close(&state);
+  CHECK(rmdir(closing_dir) == 0);
+  CHECK(rmdir(root) == 0);
+  return 0;
+}
+
 int main(void) {
   CHECK(test_add_remove_and_close_manifest() == 0);
   CHECK(test_live_manager_is_not_recovered_in_same_process() == 0);
   CHECK(test_dead_owner_is_recovered() == 0);
   CHECK(test_live_manager_is_not_recovered_across_processes() == 0);
   CHECK(test_malformed_manifest_fails_without_unlinking() == 0);
+  CHECK(test_directory_already_being_removed_is_ignored() == 0);
   puts("PASS test_agora_shm_manager_state");
   return 0;
 }

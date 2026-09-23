@@ -300,6 +300,10 @@ static int recover_all(int root_fd) {
       continue;
     }
     if (recover_published_dir(root_fd, entry->d_name) != 0) {
+      if (errno == ENOENT || errno == ENOTDIR) {
+        errno = 0;
+        continue;
+      }
       rc = -1;
       break;
     }
