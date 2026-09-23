@@ -193,6 +193,22 @@ static ssize_t wait_for_poll(TestFixture *f, AgoraShmIpcHeader *header,
   return -1;
 }
 
+static int wait_for_missing_read_entry(AgoraShmManager *manager,
+                                       const char *shm_name) {
+  AgoraShmIpcHeader header;
+  char byte;
+  for (unsigned i = 0u; i < 100u; ++i) {
+    errno = 0;
+    if (agora_shm_manager_poll(manager, shm_name, &header, &byte, 1u) == -1 &&
+        errno == ENOENT) {
+      return 0;
+    }
+    sleep_ms(10);
+  }
+  errno = ETIMEDOUT;
+  return -1;
+}
+
 static int test_audio_append_and_header(void) {
   TestFixture f;
   CHECK(fixture_open(&f, 1024u) == 0);
@@ -504,6 +520,57 @@ static int test_remove_discards_poll_entry(void) {
   return 0;
 }
 
+static int test_writer_remove_detaches_peer_read_entry(void) {
+  TestFixture f;
+  CHECK(fixture_open(&f, 1024u) == 0);
+  uint8_t data[16] = {0};
+  CHECK(write_frame(&f, data, sizeof(data), AGORA_SHM_MEDIA_VIDEO) == 0);
+
+  AgoraShmIpcHeader header;
+  char out[sizeof(data)];
+  CHECK(wait_for_poll(&f, &header, out, sizeof(out)) == (ssize_t)sizeof(out));
+  CHECK(agora_shm_manager_remove(f.writer, f.shm_name) == 0);
+  CHECK(wait_for_missing_read_entry(f.receiver, f.shm_name) == 0);
+  fixture_close(&f);
+  return 0;
+}
+
+static int test_removecmd_does_not_remove_write_entry(void) {
+  uint16_t port = reserve_udp_port();
+  CHECK(port != 0u);
+  AgoraShmManager *owner = NULL;
+  agora_localsock_client *signal_client = NULL;
+  char shm_name[AGORA_SHM_IPC_SHM_NAME_BYTES];
+  (void)snprintf(shm_name, sizeof(shm_name), "/arcmd_%ld_%u", (long)getpid(),
+                 ++g_name_counter);
+  (void)agora_shm_ipc_unlink(shm_name);
+
+  CHECK(agora_shm_manager_start(noop_frame, port, true, 4u, 1000u, NULL,
+                                TEST_READ_CAP, &owner) == 0);
+  CHECK(agora_shm_manager_add(owner, shm_name, 1024u) == 0);
+  CHECK(agora_localsock_client_create(port, &signal_client) == 0);
+
+  char payload[AGORA_SHM_IPC_SHM_NAME_BYTES] = {0};
+  (void)strncpy(payload, shm_name, sizeof(payload) - 1u);
+  CHECK(agora_localsock_client_send_datagram(
+            signal_client, (uint16_t)AGORA_LOCALSOCK_MSG_REMOVECMD, payload,
+            sizeof(payload)) == 0);
+  sleep_ms(100);
+
+  uint8_t data[8] = {0};
+  AgoraShmIpcFrameMeta meta;
+  memset(&meta, 0, sizeof(meta));
+  (void)strncpy(meta.shm_name, shm_name, sizeof(meta.shm_name) - 1u);
+  meta.media_type = (uint32_t)AGORA_SHM_MEDIA_VIDEO;
+  CHECK(agora_shm_manager_write(owner, shm_name, data, sizeof(data), &meta) ==
+        0);
+
+  agora_localsock_client_destroy(signal_client);
+  agora_shm_manager_close(owner);
+  (void)agora_shm_ipc_unlink(shm_name);
+  return 0;
+}
+
 static void *stress_writer_main(void *arg) {
   StressWriter *stress = (StressWriter *)arg;
   AgoraShmIpcFrameMeta meta = make_meta(stress->fixture, AGORA_SHM_MEDIA_VIDEO);
@@ -599,6 +666,8 @@ int main(void) {
   CHECK(test_media_type_is_locked() == 0);
   CHECK(test_callback_mode_remains_compatible() == 0);
   CHECK(test_remove_discards_poll_entry() == 0);
+  CHECK(test_writer_remove_detaches_peer_read_entry() == 0);
+  CHECK(test_removecmd_does_not_remove_write_entry() == 0);
   CHECK(test_poll_frames_are_stable_under_concurrent_writes() == 0);
   puts("PASS test_agora_shm_manager_poll");
   return 0;

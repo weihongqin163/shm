@@ -49,6 +49,7 @@ typedef struct AgoraShmManagerReadEntry {
 
 typedef struct AgoraShmManagerWriteEntry {
   int in_use;
+  int removing;
   char shm_name[AGORA_SHM_IPC_SHM_NAME_BYTES];
   AgoraShmIpc ipc;
 } AgoraShmManagerWriteEntry;
@@ -187,7 +188,7 @@ static void manager_buffer_frame(AgoraShmManager *m,
 
 static int find_write_entry_by_name(AgoraShmManager *m, const char *shm_name) {
   for (int i = 0; i < AGORA_SHM_MANAGER_MAX_ENTRIES; ++i) {
-    if (m->write_entries[i].in_use != 0 &&
+    if (m->write_entries[i].in_use != 0 && m->write_entries[i].removing == 0 &&
         strcmp(m->write_entries[i].shm_name, shm_name) == 0) {
       return i;
     }
@@ -371,6 +372,39 @@ static void manager_dispatch_writecmd(AgoraShmManager *m,
   manager_dispatch_with_ps(m, shm_key, ps);
 }
 
+static int manager_send_removecmd(AgoraShmManager *m, const char *shm_name) {
+  char payload[AGORA_SHM_IPC_SHM_NAME_BYTES] = {0};
+  (void)strncpy(payload, shm_name, sizeof(payload) - 1u);
+  if (m->server_mode && m->srv != NULL) {
+    return agora_localsock_server_send_datagram(
+        m->srv, (uint16_t)AGORA_LOCALSOCK_MSG_REMOVECMD, payload,
+        sizeof(payload));
+  }
+  if (!m->server_mode && m->cli != NULL) {
+    return agora_localsock_client_send_datagram(
+        m->cli, (uint16_t)AGORA_LOCALSOCK_MSG_REMOVECMD, payload,
+        sizeof(payload));
+  }
+  errno = EINVAL;
+  return -1;
+}
+
+static void manager_dispatch_removecmd(AgoraShmManager *m,
+                                       const char *payload) {
+  char shm_name[AGORA_SHM_IPC_SHM_NAME_BYTES];
+  memcpy(shm_name, payload, sizeof(shm_name));
+  if (shm_name[0] == '\0' || memchr(shm_name, '\0', sizeof(shm_name)) == NULL) {
+    return;
+  }
+
+  (void)pthread_mutex_lock(&m->lock);
+  int ridx = find_read_entry_by_name(m, shm_name);
+  if (ridx >= 0) {
+    clear_read_entry(&m->read_entries[ridx]);
+  }
+  (void)pthread_mutex_unlock(&m->lock);
+}
+
 static void manager_on_udp_datagram(AgoraShmManager *m, const uint8_t *data,
                                     size_t len) {
   if (len < AGORA_LOCALSOCK_HEADER_BYTES) {
@@ -410,6 +444,15 @@ static void manager_on_udp_datagram(AgoraShmManager *m, const uint8_t *data,
            sizeof(meta_storage));
     const AgoraShmIpcFrameMeta *fm = (const AgoraShmIpcFrameMeta *)meta_storage;
     manager_dispatch_writecmd(m, fm);
+    return;
+  }
+
+  if (lh.msg_type == (uint16_t)AGORA_LOCALSOCK_MSG_REMOVECMD) {
+    if (lh.payload_len != (uint32_t)AGORA_SHM_IPC_SHM_NAME_BYTES) {
+      return;
+    }
+    manager_dispatch_removecmd(
+        m, (const char *)(data + AGORA_LOCALSOCK_HEADER_BYTES));
   }
 }
 
@@ -781,8 +824,29 @@ int agora_shm_manager_remove(AgoraShmManager *m, const char *shm_name) {
 
   int widx = find_write_entry_by_name(m, shm_name);
   if (widx >= 0) {
-    clear_write_entry(&m->write_entries[widx]);
+    AgoraShmManagerWriteEntry *entry = &m->write_entries[widx];
+    entry->removing = 1;
+    char remove_name[AGORA_SHM_IPC_SHM_NAME_BYTES];
+    memcpy(remove_name, entry->shm_name, sizeof(remove_name));
     (void)pthread_mutex_unlock(&m->lock);
+
+    int first_error = 0;
+    if (manager_send_removecmd(m, remove_name) != 0) {
+      first_error = errno;
+    }
+
+    (void)pthread_mutex_lock(&m->lock);
+    clear_write_entry(entry);
+    (void)pthread_mutex_unlock(&m->lock);
+
+    if (agora_shm_ipc_unlink(remove_name) != 0 && errno != ENOENT &&
+        first_error == 0) {
+      first_error = errno;
+    }
+    if (first_error != 0) {
+      errno = first_error;
+      return -1;
+    }
     return 0;
   }
 

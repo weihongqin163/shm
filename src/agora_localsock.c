@@ -52,6 +52,7 @@ typedef enum {
   AGORA_LS_PARSE_KEEPALIVE,
   AGORA_LS_PARSE_APP,
   AGORA_LS_PARSE_WRITECMD,
+  AGORA_LS_PARSE_REMOVECMD,
   AGORA_LS_PARSE_UNKNOWN_OK,
 } agora_localsock_parse_kind;
 
@@ -64,12 +65,14 @@ static int mono_now_ns(uint64_t *out) {
   return 0;
 }
 
-static int sin_peer_eq(const struct sockaddr_in *a, const struct sockaddr_in *b) {
+static int sin_peer_eq(const struct sockaddr_in *a,
+                       const struct sockaddr_in *b) {
   return a->sin_family == b->sin_family && a->sin_port == b->sin_port &&
          a->sin_addr.s_addr == b->sin_addr.s_addr;
 }
 
-static ssize_t find_peer(agora_localsock_server *s, const struct sockaddr_in *peer) {
+static ssize_t find_peer(agora_localsock_server *s,
+                         const struct sockaddr_in *peer) {
   for (size_t i = 0; i < s->n_clients; i++) {
     if (sin_peer_eq(&s->slots[i].peer, peer)) {
       return (ssize_t)i;
@@ -78,7 +81,8 @@ static ssize_t find_peer(agora_localsock_server *s, const struct sockaddr_in *pe
   return -1;
 }
 
-static agora_localsock_parse_kind parse_datagram(const uint8_t *buf, ssize_t nread,
+static agora_localsock_parse_kind parse_datagram(const uint8_t *buf,
+                                                 ssize_t nread,
                                                  uint16_t *out_msg_type,
                                                  uint32_t *out_payload_len) {
   if (nread < (ssize_t)AGORA_LOCALSOCK_HEADER_BYTES) {
@@ -86,7 +90,8 @@ static agora_localsock_parse_kind parse_datagram(const uint8_t *buf, ssize_t nre
   }
   agora_localsock_header h;
   memcpy(&h, buf, sizeof(h));
-  if (h.magic != AGORA_LOCALSOCK_MAGIC || h.ver != (uint16_t)AGORA_LOCALSOCK_VER) {
+  if (h.magic != AGORA_LOCALSOCK_MAGIC ||
+      h.ver != (uint16_t)AGORA_LOCALSOCK_VER) {
     return AGORA_LS_PARSE_INVALID;
   }
   uint16_t msg_type = h.msg_type;
@@ -109,6 +114,9 @@ static agora_localsock_parse_kind parse_datagram(const uint8_t *buf, ssize_t nre
   if (msg_type == AGORA_LOCALSOCK_MSG_WRITECMD) {
     return AGORA_LS_PARSE_WRITECMD;
   }
+  if (msg_type == AGORA_LOCALSOCK_MSG_REMOVECMD) {
+    return AGORA_LS_PARSE_REMOVECMD;
+  }
   return AGORA_LS_PARSE_UNKNOWN_OK;
 }
 
@@ -125,11 +133,13 @@ static void evict_stale(agora_localsock_server *s, uint64_t now_ns) {
   }
 }
 
-static int apply_datagram(agora_localsock_server *s, const uint8_t *buf, ssize_t nread,
-                          const struct sockaddr_in *peer, uint64_t now_ns) {
+static int apply_datagram(agora_localsock_server *s, const uint8_t *buf,
+                          ssize_t nread, const struct sockaddr_in *peer,
+                          uint64_t now_ns) {
   uint16_t msg_type = 0;
   uint32_t payload_len = 0;
-  agora_localsock_parse_kind k = parse_datagram(buf, nread, &msg_type, &payload_len);
+  agora_localsock_parse_kind k =
+      parse_datagram(buf, nread, &msg_type, &payload_len);
   (void)msg_type;
   (void)payload_len;
   if (k == AGORA_LS_PARSE_INVALID) {
@@ -137,7 +147,7 @@ static int apply_datagram(agora_localsock_server *s, const uint8_t *buf, ssize_t
   }
   ssize_t idx = find_peer(s, peer);
   if (k == AGORA_LS_PARSE_KEEPALIVE || k == AGORA_LS_PARSE_APP ||
-      k == AGORA_LS_PARSE_WRITECMD) {
+      k == AGORA_LS_PARSE_WRITECMD || k == AGORA_LS_PARSE_REMOVECMD) {
     if (idx >= 0) {
       s->slots[(size_t)idx].last_seen_ns = now_ns;
       return 0;
@@ -158,7 +168,8 @@ static int apply_datagram(agora_localsock_server *s, const uint8_t *buf, ssize_t
 }
 
 int agora_localsock_server_create(uint16_t port, uint32_t keepalive_interval_ms,
-                                  size_t max_clients, agora_localsock_server **out) {
+                                  size_t max_clients,
+                                  agora_localsock_server **out) {
   if (out == NULL || max_clients == 0u || keepalive_interval_ms == 0u ||
       port == 0u) {
     errno = EINVAL;
@@ -294,7 +305,7 @@ int agora_localsock_server_send_datagram(agora_localsock_server *s,
 }
 
 int agora_localsock_server_poll(agora_localsock_server *s, int timeout_ms,
-                                  void *buf, size_t cap, size_t *out_len) {
+                                void *buf, size_t cap, size_t *out_len) {
   if (s == NULL || buf == NULL || out_len == NULL || cap == 0u) {
     errno = EINVAL;
     return -1;
@@ -438,9 +449,8 @@ int agora_localsock_client_send_keepalive(agora_localsock_client *c) {
   (void)pack_keepalive(pkt);
   struct sockaddr_in peer;
   client_peer_addr(c, &peer);
-  ssize_t nw =
-      sendto(c->fd, pkt, sizeof(pkt), 0, (struct sockaddr *)&peer,
-             (socklen_t)sizeof(peer));
+  ssize_t nw = sendto(c->fd, pkt, sizeof(pkt), 0, (struct sockaddr *)&peer,
+                      (socklen_t)sizeof(peer));
   if (nw != (ssize_t)sizeof(pkt)) {
     if (nw < 0) {
       return -1;
@@ -482,9 +492,8 @@ int agora_localsock_client_send_datagram(agora_localsock_client *c,
   }
   struct sockaddr_in peer;
   client_peer_addr(c, &peer);
-  ssize_t nw =
-      sendto(c->fd, buf, total, 0, (struct sockaddr *)&peer,
-             (socklen_t)sizeof(peer));
+  ssize_t nw = sendto(c->fd, buf, total, 0, (struct sockaddr *)&peer,
+                      (socklen_t)sizeof(peer));
   free(buf);
   if (nw != (ssize_t)total) {
     if (nw < 0) {
@@ -496,8 +505,8 @@ int agora_localsock_client_send_datagram(agora_localsock_client *c,
   return 0;
 }
 
-int agora_localsock_client_send_data(agora_localsock_client *c, const char *data,
-                                     int data_len) {
+int agora_localsock_client_send_data(agora_localsock_client *c,
+                                     const char *data, int data_len) {
   if (c == NULL || data_len < 0) {
     errno = EINVAL;
     return -1;

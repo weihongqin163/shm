@@ -27,6 +27,7 @@
 #define AGORA_LOCALSOCK_MSG_KEEPALIVE 1u
 #define AGORA_LOCALSOCK_MSG_APP 2u
 #define AGORA_LOCALSOCK_MSG_WRITECMD 3u
+#define AGORA_LOCALSOCK_MSG_REMOVECMD 4u
 
 /** Fixed header size on the wire (packed struct, 12 bytes on LE hosts). */
 #define AGORA_LOCALSOCK_HEADER_BYTES 12u
@@ -34,8 +35,9 @@
 /** Max IPv4 UDP payload (excluding IP/UDP headers); full datagram must fit. */
 #define AGORA_LOCALSOCK_MAX_DATAGRAM_BYTES 65507u
 
-/** Max application payload bytes in one `agora_localsock_client_send_data` call. */
-#define AGORA_LOCALSOCK_MAX_APP_PAYLOAD_BYTES \
+/** Max application payload bytes in one `agora_localsock_client_send_data`
+ * call. */
+#define AGORA_LOCALSOCK_MAX_APP_PAYLOAD_BYTES                                  \
   (AGORA_LOCALSOCK_MAX_DATAGRAM_BYTES - AGORA_LOCALSOCK_HEADER_BYTES)
 
 /**
@@ -79,7 +81,7 @@ void agora_localsock_server_destroy(agora_localsock_server *s);
  * Returns 0 on success, -1 on error (errno set).
  */
 int agora_localsock_server_poll(agora_localsock_server *s, int timeout_ms,
-                                  void *buf, size_t cap, size_t *out_len);
+                                void *buf, size_t cap, size_t *out_len);
 
 /**
  * Sends one datagram (header + payload) to every tracked peer. msg_type is
@@ -95,8 +97,8 @@ int agora_localsock_server_send_datagram(agora_localsock_server *s,
 size_t agora_localsock_server_peer_count(const agora_localsock_server *s);
 
 /**
- * Creates a UDP datagram socket (no connect). Sends use sendto to 127.0.0.1:server_port.
- * Keep-alive timing is owned by the application: call
+ * Creates a UDP datagram socket (no connect). Sends use sendto to
+ * 127.0.0.1:server_port. Keep-alive timing is owned by the application: call
  * agora_localsock_client_send_keepalive() from your business loop on a period
  * compatible with the server's keepalive_interval_ms (server evicts after
  * 5 * that interval without traffic).
@@ -113,7 +115,7 @@ void agora_localsock_client_destroy(agora_localsock_client *c);
  * (when timeout_ms >= 0). Serialized with send_keepalive/send_data via mutex.
  */
 int agora_localsock_client_poll(agora_localsock_client *c, int timeout_ms,
-                                  void *buf, size_t cap, size_t *out_len);
+                                void *buf, size_t cap, size_t *out_len);
 
 /**
  * Sends one keep-alive datagram. Not thread-safe against concurrent destroy;
@@ -125,8 +127,8 @@ int agora_localsock_client_send_keepalive(agora_localsock_client *c);
  * Sends one APP datagram (msg_type 2): header + payload. data_len may be 0
  * (data ignored). Same threading notes as send_keepalive.
  */
-int agora_localsock_client_send_data(agora_localsock_client *c, const char *data,
-                                     int data_len);
+int agora_localsock_client_send_data(agora_localsock_client *c,
+                                     const char *data, int data_len);
 
 /**
  * Sends one datagram with arbitrary msg_type (header + payload). payload may
