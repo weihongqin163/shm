@@ -321,6 +321,24 @@ static int recover_all(int root_fd) {
 }
 
 static int ensure_root(const char *root) {
+  char path[PATH_MAX];
+  size_t len = strlen(root);
+  if (len >= sizeof(path)) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  memcpy(path, root, len + 1u);
+  /* Create missing ancestors without changing existing directory permissions. */
+  for (char *p = path + 1; *p != '\0'; ++p) {
+    if (*p != '/' || p[-1] == '/') {
+      continue;
+    }
+    *p = '\0';
+    if (mkdir(path, 0700) != 0 && errno != EEXIST) {
+      return -1;
+    }
+    *p = '/';
+  }
   if (mkdir(root, 0700) != 0 && errno != EEXIST) {
     return -1;
   }

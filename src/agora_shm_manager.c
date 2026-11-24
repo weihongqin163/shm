@@ -4,11 +4,13 @@
  * date: 2026-04-15
  */
 
+#define _DARWIN_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include "agora_shm_manager.h"
 
 #include "agora_localsock.h"
+#include "agora_localsock_internal.h"
 #include "agora_shm_ipc.h"
 #include "agora_shm_manager_state.h"
 
@@ -19,6 +21,7 @@
 #include <stdalign.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -29,6 +32,9 @@
 #define AGORA_SHM_MANAGER_DEFAULT_READ_CAP (256u * 1024u)
 #define AGORA_SHM_MANAGER_UDP_CAP 2048u
 #define AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY_IN_MS (60u)
+#define AGORA_SHM_MANAGER_ERROR_WAIT_MS 20u
+#define AGORA_SHM_MANAGER_IDLE_WAIT_MS 10u
+#define AGORA_SHM_MANAGER_REBUILD_ERRORS 3u
 
 #define AGORA_SHM_IPC_MAGIC_EXPECT 0xA601C0DEu
 #define AGORA_SHM_IPC_VER_EXPECT 3u
@@ -57,10 +63,18 @@ typedef struct AgoraShmManagerWriteEntry {
 
 struct AgoraShmManager {
   pthread_mutex_t lock;
+  pthread_mutex_t transport_lock;
+  pthread_mutex_t wait_lock;
+  pthread_cond_t wake;
   atomic_int stop;
+  atomic_int recovering;
+  int rebuild_needed; /* Protected by transport_lock. */
   pthread_t worker;
   int worker_started;
   bool server_mode;
+  uint16_t port;
+  size_t max_clients;
+  uint32_t keepalive_ms;
   agora_localsock_server *srv;
   agora_localsock_client *cli;
   AgoraShmManagerReadEntry read_entries[AGORA_SHM_MANAGER_MAX_ENTRIES];
@@ -76,7 +90,7 @@ struct AgoraShmManager {
 static int mono_now_ns(uint64_t *out) {
   struct timespec ts;
   if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-    return -1;
+    return -errno;
   }
   *out = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
   return 0;
@@ -218,11 +232,11 @@ static int manager_probe_shm_payload_size(const char *shm_name,
                                           uint32_t *out_ps) {
   if (shm_name == NULL || out_ps == NULL) {
     errno = EINVAL;
-    return -1;
+    return -errno;
   }
   int fd = shm_open(shm_name, O_RDONLY, 0);
   if (fd < 0) {
-    return -1;
+    return -errno;
   }
   size_t map_len = sizeof(AgoraShmIpcHeader);
   void *p = mmap(NULL, map_len, PROT_READ, MAP_SHARED, fd, 0);
@@ -230,7 +244,7 @@ static int manager_probe_shm_payload_size(const char *shm_name,
     int e = errno;
     (void)close(fd);
     errno = e;
-    return -1;
+    return -errno;
   }
   const AgoraShmIpcHeader *h = (const AgoraShmIpcHeader *)p;
   if (h->magic != AGORA_SHM_IPC_MAGIC_EXPECT ||
@@ -238,7 +252,7 @@ static int manager_probe_shm_payload_size(const char *shm_name,
     (void)munmap(p, map_len);
     (void)close(fd);
     errno = EIO;
-    return -1;
+    return -errno;
   }
   *out_ps = h->payload_size;
   (void)munmap(p, map_len);
@@ -374,21 +388,14 @@ static void manager_dispatch_writecmd(AgoraShmManager *m,
   manager_dispatch_with_ps(m, shm_key, ps);
 }
 
+static int manager_send_datagram(AgoraShmManager *m, uint16_t type,
+                                  const void *payload, size_t size);
+
 static int manager_send_removecmd(AgoraShmManager *m, const char *shm_name) {
   char payload[AGORA_SHM_IPC_SHM_NAME_BYTES] = {0};
   (void)strncpy(payload, shm_name, sizeof(payload) - 1u);
-  if (m->server_mode && m->srv != NULL) {
-    return agora_localsock_server_send_datagram(
-        m->srv, (uint16_t)AGORA_LOCALSOCK_MSG_REMOVECMD, payload,
-        sizeof(payload));
-  }
-  if (!m->server_mode && m->cli != NULL) {
-    return agora_localsock_client_send_datagram(
-        m->cli, (uint16_t)AGORA_LOCALSOCK_MSG_REMOVECMD, payload,
-        sizeof(payload));
-  }
-  errno = EINVAL;
-  return -1;
+  return manager_send_datagram(m, AGORA_LOCALSOCK_MSG_REMOVECMD,
+                               payload, sizeof(payload));
 }
 
 static void manager_dispatch_removecmd(AgoraShmManager *m,
@@ -458,91 +465,295 @@ static void manager_on_udp_datagram(AgoraShmManager *m, const uint8_t *data,
   }
 }
 
-static void *agora_shm_manager_worker_server(void *arg) {
-  AgoraShmManager *m = (AgoraShmManager *)arg;
+static int manager_stopped(AgoraShmManager *m) {
+  return atomic_load_explicit(&m->stop, memory_order_acquire) != 0;
+}
 
-  uint8_t *srv_poll_buf = (uint8_t *)malloc((size_t)AGORA_SHM_MANAGER_UDP_CAP);
-  if (srv_poll_buf == NULL) {
-    return NULL;
+static void manager_wake(AgoraShmManager *m) {
+  (void)pthread_mutex_lock(&m->wait_lock);
+  (void)pthread_cond_broadcast(&m->wake);
+  (void)pthread_mutex_unlock(&m->wait_lock);
+}
+
+/* No entry/transport locks may be held while waiting or logging. */
+static void manager_wait(AgoraShmManager *m, unsigned ms) {
+  struct timespec until;
+  if (clock_gettime(CLOCK_MONOTONIC, &until) != 0) {
+    struct timespec delay = {0, (long)ms * 1000000L};
+    while (!manager_stopped(m) && nanosleep(&delay, &delay) != 0 &&
+           errno == EINTR) {
+    }
+    return;
   }
-
-  for (;;) {
-    if (atomic_load_explicit(&m->stop, memory_order_acquire) != 0) {
+  until.tv_nsec += (long)ms * 1000000L;
+  if (until.tv_nsec >= 1000000000L) {
+    ++until.tv_sec;
+    until.tv_nsec -= 1000000000L;
+  }
+  (void)pthread_mutex_lock(&m->wait_lock);
+  while (!manager_stopped(m)) {
+#if defined(__APPLE__)
+    struct timespec now, remaining;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
       break;
     }
-    size_t srv_poll_len = 0u;
-    if (agora_localsock_server_poll(m->srv, 200, srv_poll_buf,
-                                    (size_t)AGORA_SHM_MANAGER_UDP_CAP,
-                                    &srv_poll_len) != 0) {
-      if (errno == EINTR) {
+    remaining.tv_sec = until.tv_sec - now.tv_sec;
+    remaining.tv_nsec = until.tv_nsec - now.tv_nsec;
+    if (remaining.tv_nsec < 0) {
+      --remaining.tv_sec;
+      remaining.tv_nsec += 1000000000L;
+    }
+    if (remaining.tv_sec < 0) {
+      break;
+    }
+    int rc = pthread_cond_timedwait_relative_np(&m->wake, &m->wait_lock,
+                                                &remaining);
+#else
+    int rc = pthread_cond_timedwait(&m->wake, &m->wait_lock, &until);
+#endif
+    if (rc == ETIMEDOUT) {
+      break;
+    }
+    if (rc != 0) {
+      break;
+    }
+    /* Spurious wakeups must not shorten the error delay. */
+  }
+  (void)pthread_mutex_unlock(&m->wait_lock);
+}
+
+static int manager_condition_init(pthread_cond_t *condition) {
+#if defined(__APPLE__)
+  return pthread_cond_init(condition, NULL);
+#else
+  pthread_condattr_t attr;
+  int rc = pthread_condattr_init(&attr);
+  if (rc != 0) {
+    return rc;
+  }
+  rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+  if (rc == 0) {
+    rc = pthread_cond_init(condition, &attr);
+  }
+  (void)pthread_condattr_destroy(&attr);
+  return rc;
+#endif
+}
+
+static void manager_log(AgoraShmManager *m, const char *operation,
+                        int error, short events, unsigned failures) {
+  (void)fprintf(stderr,
+                "[agora_shm_manager] mode=%s port=%u op=%s errno=%d "
+                "revents=0x%x failures=%u\n",
+                m->server_mode ? "server" : "client", (unsigned)m->port,
+                operation, error, (unsigned short)events, failures);
+}
+
+static void manager_log_state(AgoraShmManager *m, const char *operation,
+                              const char *shm_name, int error) {
+  (void)fprintf(stderr,
+                "[agora_shm_manager] mode=%s port=%u op=%s errno=%d "
+                "path=%s shm_name=%s; ownership persistence failed\n",
+                m->server_mode ? "server" : "client", (unsigned)m->port,
+                operation, error,
+                m->state.dir_path[0] != '\0' ? m->state.dir_path :
+                                               AGORA_SHM_MANAGER_STATE_ROOT,
+                shm_name != NULL ? shm_name : "-");
+}
+
+static int manager_invalid_socket(int error) {
+  return error == EBADF || error == ENOTSOCK;
+}
+
+static int manager_temporary_error(int error) {
+  return error == EINTR || error == EAGAIN || error == EWOULDBLOCK;
+}
+
+static int manager_send_datagram(AgoraShmManager *m, uint16_t type,
+                                  const void *payload, size_t size) {
+  (void)pthread_mutex_lock(&m->transport_lock);
+  if (atomic_load_explicit(&m->recovering, memory_order_acquire) ||
+      (m->server_mode ? m->srv == NULL : m->cli == NULL)) {
+    (void)pthread_mutex_unlock(&m->transport_lock);
+    errno = EAGAIN;
+    return -errno;
+  }
+  int rc = m->server_mode ?
+      agora_localsock_server_send_datagram(m->srv, type, payload, size) :
+      agora_localsock_client_send_datagram(m->cli, type, payload, size);
+  int error = errno;
+  if (rc != 0 && manager_invalid_socket(error)) {
+    m->rebuild_needed = 1;
+    atomic_store_explicit(&m->recovering, 1, memory_order_release);
+  }
+  (void)pthread_mutex_unlock(&m->transport_lock);
+  if (rc != 0) {
+    manager_log(m, "send", error, 0, 0);
+    manager_wake(m);
+    errno = error;
+    return -errno;
+  }
+  return 0;
+}
+
+static void manager_worker_error(AgoraShmManager *m, const char *operation,
+                                 int error, short events, unsigned *failures,
+                                 int socket_error) {
+  if (!manager_temporary_error(error)) {
+    atomic_store_explicit(&m->recovering, 1, memory_order_release);
+    if (*failures < AGORA_SHM_MANAGER_REBUILD_ERRORS) {
+      ++*failures;
+    }
+    if (socket_error &&
+        (manager_invalid_socket(error) ||
+         *failures >= AGORA_SHM_MANAGER_REBUILD_ERRORS)) {
+      (void)pthread_mutex_lock(&m->transport_lock);
+      m->rebuild_needed = 1;
+      (void)pthread_mutex_unlock(&m->transport_lock);
+    }
+  }
+  manager_log(m, operation, error, events, *failures);
+  manager_wait(m, AGORA_SHM_MANAGER_ERROR_WAIT_MS);
+}
+
+static int manager_rebuild_transport(AgoraShmManager *m, unsigned failures) {
+  (void)pthread_mutex_lock(&m->transport_lock);
+  if (!m->rebuild_needed) {
+    (void)pthread_mutex_unlock(&m->transport_lock);
+    return 0;
+  }
+  atomic_store_explicit(&m->recovering, 1, memory_order_release);
+  agora_localsock_server *old_srv = m->srv;
+  agora_localsock_client *old_cli = m->cli;
+  m->srv = NULL;
+  m->cli = NULL;
+  (void)pthread_mutex_unlock(&m->transport_lock);
+
+  /* Only the worker replaces sockets; detached objects have no users. */
+  if (old_srv != NULL || old_cli != NULL) {
+    manager_log(m, "rebuild_begin", 0, 0, failures);
+  }
+  agora_localsock_server_destroy(old_srv);
+  agora_localsock_client_destroy(old_cli);
+  if (manager_stopped(m)) {
+    return -ECANCELED;
+  }
+  agora_localsock_server *new_srv = NULL;
+  agora_localsock_client *new_cli = NULL;
+  int rc;
+  if (m->server_mode) {
+    rc = agora_localsock_server_create(m->port, m->keepalive_ms,
+                                       m->max_clients, &new_srv);
+  } else {
+    rc = agora_localsock_client_create(m->port, &new_cli);
+    if (rc == 0) {
+      rc = agora_localsock_client_send_keepalive(new_cli);
+    }
+  }
+  int error = errno;
+  if (rc != 0 || manager_stopped(m)) {
+    agora_localsock_server_destroy(new_srv);
+    agora_localsock_client_destroy(new_cli);
+    if (rc != 0) {
+      manager_log(m, "rebuild", error, 0, failures);
+      manager_wait(m, AGORA_SHM_MANAGER_ERROR_WAIT_MS);
+    }
+    return rc != 0 ? -error : -ECANCELED;
+  }
+
+  (void)pthread_mutex_lock(&m->transport_lock);
+  m->srv = new_srv;
+  m->cli = new_cli;
+  m->rebuild_needed = 0;
+  atomic_store_explicit(&m->recovering, 0, memory_order_release);
+  (void)pthread_mutex_unlock(&m->transport_lock);
+  manager_log(m, "recovered", 0, 0, 0);
+  return 1;
+}
+
+static void *manager_worker(AgoraShmManager *m) {
+  unsigned poll_failures = 0;
+  unsigned keepalive_failures = 0;
+  unsigned clock_failures = 0;
+  uint64_t last_ka_ns = 0;
+
+  while (!manager_stopped(m)) {
+    int rebuilt = manager_rebuild_transport(
+        m, poll_failures > keepalive_failures ? poll_failures : keepalive_failures);
+    if (rebuilt < 0) {
+      continue;
+    }
+    if (rebuilt > 0) {
+      poll_failures = keepalive_failures = 0;
+      last_ka_ns = 0;
+    }
+    if (!m->server_mode) {
+      uint64_t now_ns = 0;
+      if (mono_now_ns(&now_ns) != 0) {
+        manager_worker_error(m, "clock", errno, 0, &clock_failures, 0);
         continue;
       }
-      break;
-    }
-    int drain_poll_failed = 0;
-    for (;;) {
-      if (srv_poll_len > 0u) {
-        manager_on_udp_datagram(m, srv_poll_buf, srv_poll_len);
-      }
-      srv_poll_len = 0u;
-      if (agora_localsock_server_poll(m->srv, 0, srv_poll_buf,
-                                      (size_t)AGORA_SHM_MANAGER_UDP_CAP,
-                                      &srv_poll_len) != 0) {
-        if (errno == EINTR) {
+      clock_failures = 0;
+      if (last_ka_ns == 0 || now_ns - last_ka_ns >= 500000000ull) {
+        (void)pthread_mutex_lock(&m->transport_lock);
+        int rc = agora_localsock_client_send_keepalive(m->cli);
+        int error = errno;
+        (void)pthread_mutex_unlock(&m->transport_lock);
+        if (rc != 0) {
+          manager_worker_error(m, "keepalive", error, 0,
+                                &keepalive_failures, 1);
           continue;
         }
-        drain_poll_failed = 1;
-        break;
-      }
-      if (srv_poll_len == 0u) {
-        break;
+        keepalive_failures = 0;
+        last_ka_ns = now_ns;
       }
     }
-    if (drain_poll_failed != 0) {
-      break;
+
+    size_t len = 0;
+    short events;
+    (void)pthread_mutex_lock(&m->transport_lock);
+    int rc;
+    if (m->server_mode) {
+      rc = agora_localsock_server_poll(m->srv, 0, m->udp_recv,
+                                       AGORA_SHM_MANAGER_UDP_CAP, &len);
+      events = agora_localsock_server_poll_events(m->srv);
+    } else {
+      rc = agora_localsock_client_poll(m->cli, 0, m->udp_recv,
+                                       AGORA_SHM_MANAGER_UDP_CAP, &len);
+      events = agora_localsock_client_poll_events(m->cli);
+    }
+    int error = errno;
+    int healthy = rc == 0 || error == EAGAIN || error == EWOULDBLOCK;
+    int recovered = 0;
+    if (healthy && !m->rebuild_needed) {
+      poll_failures = 0;
+      recovered = atomic_exchange_explicit(&m->recovering, 0,
+                                            memory_order_acq_rel);
+    }
+    (void)pthread_mutex_unlock(&m->transport_lock);
+    if (recovered) {
+      manager_log(m, "recovered", 0, 0, 0);
+    }
+    if (!healthy) {
+      manager_worker_error(m, m->server_mode ? "server_poll" : "client_poll",
+                            error, events, &poll_failures, 1);
+      continue;
+    }
+    if (len != 0) {
+      manager_on_udp_datagram(m, m->udp_recv, len);
+    } else {
+      manager_wait(m, AGORA_SHM_MANAGER_IDLE_WAIT_MS);
     }
   }
-
-  free(srv_poll_buf);
   return NULL;
 }
 
+static void *agora_shm_manager_worker_server(void *arg) {
+  return manager_worker((AgoraShmManager *)arg);
+}
+
 static void *agora_shm_manager_worker_client(void *arg) {
-  AgoraShmManager *m = (AgoraShmManager *)arg;
-  uint8_t *udp = m->udp_recv;
-  uint64_t last_ka_ns = 0;
-
-  for (;;) {
-    if (atomic_load_explicit(&m->stop, memory_order_acquire) != 0) {
-      break;
-    }
-
-    uint64_t now_ns = 0;
-    if (mono_now_ns(&now_ns) != 0) {
-      break;
-    }
-    if (last_ka_ns == 0) {
-      last_ka_ns = now_ns;
-    } else if (now_ns - last_ka_ns >= 500000000ull) {
-      if (agora_localsock_client_send_keepalive(m->cli) != 0) {
-        break;
-      }
-      last_ka_ns = now_ns;
-    }
-
-    size_t len = 0u;
-    if (agora_localsock_client_poll(m->cli, 10, udp, AGORA_SHM_MANAGER_UDP_CAP,
-                                    &len) != 0) {
-      if (errno == EAGAIN || errno == EINTR) {
-        continue;
-      }
-      break;
-    }
-
-    manager_on_udp_datagram(m, udp, len);
-  }
-
-  return NULL;
+  return manager_worker((AgoraShmManager *)arg);
 }
 
 int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
@@ -550,127 +761,104 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
                             size_t localsock_max_clients,
                             uint32_t localsock_keepalive_ms, void *user,
                             size_t max_read_cap, AgoraShmManager **out) {
-  if (out == NULL || port == 0u) {
+  if (out == NULL || port == 0u ||
+      (server_mode && (localsock_max_clients == 0u ||
+                       localsock_keepalive_ms == 0u))) {
     errno = EINVAL;
-    return -1;
+    return -errno;
   }
-  if (server_mode) {
-    if (localsock_max_clients == 0u || localsock_keepalive_ms == 0u) {
-      errno = EINVAL;
-      return -1;
-    }
-  }
-
-  size_t cap = max_read_cap;
-  if (cap == 0u) {
-    cap = AGORA_SHM_MANAGER_DEFAULT_READ_CAP;
-  }
-
   AgoraShmManager *m = (AgoraShmManager *)calloc(1, sizeof(*m));
   if (m == NULL) {
-    return -1;
+    return -errno;
   }
-
-  m->read_cap = cap;
+  m->read_cap = max_read_cap != 0 ? max_read_cap :
+                                  AGORA_SHM_MANAGER_DEFAULT_READ_CAP;
   m->on_frame = on_frame;
   m->user = user;
   m->server_mode = server_mode;
+  m->port = port;
+  m->max_clients = localsock_max_clients;
+  m->keepalive_ms = localsock_keepalive_ms;
   atomic_init(&m->stop, 0);
+  atomic_init(&m->recovering, 0);
 
+  m->state.lock_fd = -1;
   if (agora_shm_manager_state_open(&m->state) != 0) {
-    int e = errno;
-    free(m);
-    errno = e;
-    return -1;
+    manager_log_state(m, "state_open", NULL, errno);
   }
+  int sync_initialized = 0;
+  int error = pthread_mutex_init(&m->lock, NULL);
+  if (error != 0) {
+    goto fail;
+  }
+  sync_initialized = 1;
+  error = pthread_mutex_init(&m->transport_lock, NULL);
+  if (error != 0) {
+    goto fail;
+  }
+  sync_initialized = 2;
+  error = pthread_mutex_init(&m->wait_lock, NULL);
+  if (error != 0) {
+    goto fail;
+  }
+  sync_initialized = 3;
+  error = manager_condition_init(&m->wake);
+  if (error != 0) {
+    goto fail;
+  }
+  sync_initialized = 4;
 
   if (on_frame == NULL) {
-    m->read_scratch = (uint8_t *)malloc(cap);
+    m->read_scratch = (uint8_t *)malloc(m->read_cap);
     if (m->read_scratch == NULL) {
-      int e = errno;
-      agora_shm_manager_state_close(&m->state);
-      free(m);
-      errno = e;
-      return -1;
+      error = errno;
+      goto fail;
     }
   }
-
-  if (!server_mode) {
-    m->udp_recv = (uint8_t *)malloc(AGORA_SHM_MANAGER_UDP_CAP);
-    if (m->udp_recv == NULL) {
-      int e = errno;
-      free(m->read_scratch);
-      agora_shm_manager_state_close(&m->state);
-      free(m);
-      errno = e;
-      return -1;
-    }
+  m->udp_recv = (uint8_t *)malloc(AGORA_SHM_MANAGER_UDP_CAP);
+  if (m->udp_recv == NULL) {
+    error = errno;
+    goto fail;
   }
-
-  if (pthread_mutex_init(&m->lock, NULL) != 0) {
-    int e = errno;
-    free(m->udp_recv);
-    free(m->read_scratch);
-    agora_shm_manager_state_close(&m->state);
-    free(m);
-    errno = e;
-    return -1;
+  int rc = server_mode ?
+      agora_localsock_server_create(port, localsock_keepalive_ms,
+                                     localsock_max_clients, &m->srv) :
+      agora_localsock_client_create(port, &m->cli);
+  if (rc != 0) {
+    error = errno;
+    goto fail;
   }
-
-  if (server_mode) {
-    if (agora_localsock_server_create(port, localsock_keepalive_ms,
-                                      localsock_max_clients, &m->srv) != 0) {
-      int e = errno;
-      (void)pthread_mutex_destroy(&m->lock);
-      free(m->udp_recv);
-      free(m->read_scratch);
-      agora_shm_manager_state_close(&m->state);
-      free(m);
-      errno = e;
-      return -1;
-    }
-    if (pthread_create(&m->worker, NULL, agora_shm_manager_worker_server, m) !=
-        0) {
-      int e = errno;
-      agora_localsock_server_destroy(m->srv);
-      m->srv = NULL;
-      (void)pthread_mutex_destroy(&m->lock);
-      free(m->udp_recv);
-      free(m->read_scratch);
-      agora_shm_manager_state_close(&m->state);
-      free(m);
-      errno = e;
-      return -1;
-    }
-  } else {
-    if (agora_localsock_client_create(port, &m->cli) != 0) {
-      int e = errno;
-      (void)pthread_mutex_destroy(&m->lock);
-      free(m->udp_recv);
-      free(m->read_scratch);
-      agora_shm_manager_state_close(&m->state);
-      free(m);
-      errno = e;
-      return -1;
-    }
-    if (pthread_create(&m->worker, NULL, agora_shm_manager_worker_client, m) !=
-        0) {
-      int e = errno;
-      agora_localsock_client_destroy(m->cli);
-      m->cli = NULL;
-      (void)pthread_mutex_destroy(&m->lock);
-      free(m->udp_recv);
-      free(m->read_scratch);
-      agora_shm_manager_state_close(&m->state);
-      free(m);
-      errno = e;
-      return -1;
-    }
+  error = pthread_create(&m->worker, NULL,
+                          server_mode ? agora_shm_manager_worker_server :
+                                        agora_shm_manager_worker_client, m);
+  if (error != 0) {
+    goto fail;
   }
-
   m->worker_started = 1;
   *out = m;
   return 0;
+
+fail:
+  agora_localsock_server_destroy(m->srv);
+  agora_localsock_client_destroy(m->cli);
+  free(m->udp_recv);
+  free(m->read_scratch);
+  if (sync_initialized >= 4) {
+    (void)pthread_cond_destroy(&m->wake);
+  }
+  if (sync_initialized >= 3) {
+    (void)pthread_mutex_destroy(&m->wait_lock);
+  }
+  if (sync_initialized >= 2) {
+    (void)pthread_mutex_destroy(&m->transport_lock);
+  }
+  if (sync_initialized >= 1) {
+    (void)pthread_mutex_destroy(&m->lock);
+  }
+  agora_shm_manager_state_close(&m->state);
+  free(m);
+  errno = error;
+  return -errno;
 }
 
 void agora_shm_manager_close(AgoraShmManager *m) {
@@ -679,6 +867,7 @@ void agora_shm_manager_close(AgoraShmManager *m) {
   }
 
   atomic_store_explicit(&m->stop, 1, memory_order_release);
+  manager_wake(m);
 
   if (m->worker_started != 0) {
     (void)pthread_join(m->worker, NULL);
@@ -725,7 +914,9 @@ void agora_shm_manager_close(AgoraShmManager *m) {
       int unlink_rc = agora_shm_ipc_unlink(unlink_name);
       int unlink_errno = errno;
       if (unlink_rc == 0 || unlink_errno == ENOENT) {
-        if (agora_shm_manager_state_remove(&m->state, unlink_name) != 0) {
+        if (m->state.lock_fd >= 0 &&
+            agora_shm_manager_state_remove(&m->state, unlink_name) != 0) {
+          manager_log_state(m, "state_remove", unlink_name, errno);
           preserve_state = 1;
         }
       } else {
@@ -753,6 +944,10 @@ void agora_shm_manager_close(AgoraShmManager *m) {
 
   (void)pthread_mutex_destroy(&m->lock);
 
+  (void)pthread_mutex_destroy(&m->transport_lock);
+  (void)pthread_cond_destroy(&m->wake);
+  (void)pthread_mutex_destroy(&m->wait_lock);
+
   free(m->udp_recv);
   m->udp_recv = NULL;
   free(m->read_scratch);
@@ -771,7 +966,7 @@ agora_shm_manager_addreader_inner(AgoraShmManager *m, const char *shm_name,
   if (m == NULL || shm_name == NULL || shm_name[0] == '\0' ||
       max_payload_size == 0u) {
     errno = EINVAL;
-    return -1;
+    return -errno;
   }
 
   (void)pthread_mutex_lock(&m->lock);
@@ -779,19 +974,19 @@ agora_shm_manager_addreader_inner(AgoraShmManager *m, const char *shm_name,
   if (find_write_entry_by_name(m, shm_name) >= 0) {
     (void)pthread_mutex_unlock(&m->lock);
     errno = EEXIST;
-    return -1;
+    return -errno;
   }
   if (find_read_entry_by_name(m, shm_name) >= 0) {
     (void)pthread_mutex_unlock(&m->lock);
     errno = EEXIST;
-    return -1;
+    return -errno;
   }
 
   int slot = find_free_read_slot(m);
   if (slot < 0) {
     (void)pthread_mutex_unlock(&m->lock);
     errno = ENOMEM;
-    return -1;
+    return -errno;
   }
 
   AgoraShmIpc ipc;
@@ -800,7 +995,7 @@ agora_shm_manager_addreader_inner(AgoraShmManager *m, const char *shm_name,
     int e = errno;
     (void)pthread_mutex_unlock(&m->lock);
     errno = e;
-    return -1;
+    return -errno;
   }
 
   AgoraShmManagerReadEntry *e = &m->read_entries[slot];
@@ -820,7 +1015,7 @@ int agora_shm_manager_add(AgoraShmManager *m, const char *shm_name,
   if (m == NULL || shm_name == NULL || shm_name[0] == '\0' ||
       max_payload_size == 0u) {
     errno = EINVAL;
-    return -1;
+    return -errno;
   }
 
   (void)pthread_mutex_lock(&m->lock);
@@ -828,19 +1023,19 @@ int agora_shm_manager_add(AgoraShmManager *m, const char *shm_name,
   if (find_write_entry_by_name(m, shm_name) >= 0) {
     (void)pthread_mutex_unlock(&m->lock);
     errno = EEXIST;
-    return -1;
+    return -errno;
   }
   if (find_read_entry_by_name(m, shm_name) >= 0) {
     (void)pthread_mutex_unlock(&m->lock);
     errno = EEXIST;
-    return -1;
+    return -errno;
   }
 
   int slot = find_free_write_slot(m);
   if (slot < 0) {
     (void)pthread_mutex_unlock(&m->lock);
     errno = ENOMEM;
-    return -1;
+    return -errno;
   }
 
   AgoraShmIpc ipc;
@@ -849,7 +1044,7 @@ int agora_shm_manager_add(AgoraShmManager *m, const char *shm_name,
     int e = errno;
     (void)pthread_mutex_unlock(&m->lock);
     errno = e;
-    return -1;
+    return -errno;
   }
   if (agora_shm_ipc_writer_session_begin(&ipc) != 0) {
     int e = errno;
@@ -857,15 +1052,11 @@ int agora_shm_manager_add(AgoraShmManager *m, const char *shm_name,
     (void)agora_shm_ipc_unlink(shm_name);
     (void)pthread_mutex_unlock(&m->lock);
     errno = e;
-    return -1;
+    return -errno;
   }
-  if (agora_shm_manager_state_add(&m->state, shm_name) != 0) {
-    int e = errno;
-    agora_shm_ipc_close(&ipc);
-    (void)agora_shm_ipc_unlink(shm_name);
-    (void)pthread_mutex_unlock(&m->lock);
-    errno = e;
-    return -1;
+  if (m->state.lock_fd >= 0 &&
+      agora_shm_manager_state_add(&m->state, shm_name) != 0) {
+    manager_log_state(m, "state_add", shm_name, errno);
   }
 
   AgoraShmManagerWriteEntry *e = &m->write_entries[slot];
@@ -882,7 +1073,7 @@ int agora_shm_manager_add(AgoraShmManager *m, const char *shm_name,
 int agora_shm_manager_remove(AgoraShmManager *m, const char *shm_name) {
   if (m == NULL || shm_name == NULL || shm_name[0] == '\0') {
     errno = EINVAL;
-    return -1;
+    return -errno;
   }
 
   (void)pthread_mutex_lock(&m->lock);
@@ -908,18 +1099,17 @@ int agora_shm_manager_remove(AgoraShmManager *m, const char *shm_name) {
     int unlink_errno = errno;
     if (unlink_rc == 0 || unlink_errno == ENOENT) {
       (void)pthread_mutex_lock(&m->lock);
-      int state_rc = agora_shm_manager_state_remove(&m->state, remove_name);
-      int state_errno = errno;
-      (void)pthread_mutex_unlock(&m->lock);
-      if (state_rc != 0 && first_error == 0) {
-        first_error = state_errno;
+      if (m->state.lock_fd >= 0 &&
+          agora_shm_manager_state_remove(&m->state, remove_name) != 0) {
+        manager_log_state(m, "state_remove", remove_name, errno);
       }
+      (void)pthread_mutex_unlock(&m->lock);
     } else if (first_error == 0) {
       first_error = unlink_errno;
     }
     if (first_error != 0) {
       errno = first_error;
-      return -1;
+      return -errno;
     }
     return 0;
   }
@@ -933,7 +1123,7 @@ int agora_shm_manager_remove(AgoraShmManager *m, const char *shm_name) {
 
   (void)pthread_mutex_unlock(&m->lock);
   errno = ENOENT;
-  return -1;
+  return -errno;
 }
 
 int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
@@ -941,7 +1131,7 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
                             const AgoraShmIpcFrameMeta *meta) {
   if (m == NULL || shm_name == NULL || shm_name[0] == '\0' || meta == NULL) {
     errno = EINVAL;
-    return -1;
+    return -errno;
   }
 
   (void)pthread_mutex_lock(&m->lock);
@@ -950,7 +1140,7 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
   if (widx < 0) {
     (void)pthread_mutex_unlock(&m->lock);
     errno = ENOENT;
-    return -1;
+    return -errno;
   }
 
   AgoraShmManagerWriteEntry *e = &m->write_entries[widx];
@@ -958,25 +1148,14 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
     int err = errno;
     (void)pthread_mutex_unlock(&m->lock);
     errno = err;
-    return -1;
+    return -errno;
   }
 
   AgoraShmIpcFrameMeta meta_copy = *meta;
   (void)pthread_mutex_unlock(&m->lock);
 
-  if (m->server_mode && m->srv != NULL) {
-    return agora_localsock_server_send_datagram(
-        m->srv, (uint16_t)AGORA_LOCALSOCK_MSG_WRITECMD, &meta_copy,
-        sizeof(meta_copy));
-  }
-  if (!m->server_mode && m->cli != NULL) {
-    return agora_localsock_client_send_datagram(
-        m->cli, (uint16_t)AGORA_LOCALSOCK_MSG_WRITECMD, &meta_copy,
-        sizeof(meta_copy));
-  }
-
-  errno = EINVAL;
-  return -1;
+  return manager_send_datagram(m, AGORA_LOCALSOCK_MSG_WRITECMD,
+                               &meta_copy, sizeof(meta_copy));
 }
 
 ssize_t agora_shm_manager_poll(AgoraShmManager *m, const char *shm_name,
@@ -985,7 +1164,7 @@ ssize_t agora_shm_manager_poll(AgoraShmManager *m, const char *shm_name,
   if (m == NULL || shm_name == NULL || shm_name[0] == '\0' || header == NULL ||
       out == NULL || max_payload_size == 0u) {
     errno = EINVAL;
-    return -1;
+    return -errno;
   }
 
   (void)pthread_mutex_lock(&m->lock);
@@ -993,19 +1172,26 @@ ssize_t agora_shm_manager_poll(AgoraShmManager *m, const char *shm_name,
   if (m->on_frame != NULL) {
     (void)pthread_mutex_unlock(&m->lock);
     errno = ENOTSUP;
-    return -1;
+    return -errno;
   }
 
   int ridx = find_read_entry_by_name(m, shm_name);
   if (ridx < 0) {
+    int error = atomic_load_explicit(&m->recovering, memory_order_acquire) ?
+                    EAGAIN : ENOENT;
     (void)pthread_mutex_unlock(&m->lock);
-    errno = ENOENT;
-    return -1;
+    errno = error;
+    return -errno;
   }
 
   AgoraShmManagerReadEntry *e = &m->read_entries[ridx];
   if (e->data_len == 0u) {
+    int recovering = atomic_load_explicit(&m->recovering, memory_order_acquire);
     (void)pthread_mutex_unlock(&m->lock);
+    if (recovering) {
+      errno = EAGAIN;
+      return -errno;
+    }
     return 0;
   }
 
@@ -1017,13 +1203,13 @@ ssize_t agora_shm_manager_poll(AgoraShmManager *m, const char *shm_name,
   } else if (copy_len > max_payload_size) {
     (void)pthread_mutex_unlock(&m->lock);
     errno = ENOBUFS;
-    return -1;
+    return -errno;
   }
 
   if (copy_len > (size_t)SSIZE_MAX) {
     (void)pthread_mutex_unlock(&m->lock);
     errno = EOVERFLOW;
-    return -1;
+    return -errno;
   }
 
   memcpy(out, e->buffer, copy_len);

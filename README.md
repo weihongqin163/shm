@@ -125,24 +125,30 @@ if (n > 0) {
 
 ### manager 异常退出恢复与 Pod 部署
 
-- 状态根目录固定为 **`/tmp/agora_shm_manager`**。每个 manager 使用独立子目录、`flock` 独占锁和 `shm.list`；`add` 成功返回前写入名称，`remove` 成功 unlink 后删除名称。
-- `agora_shm_manager_start` 扫描状态目录：仍被锁定的目录属于活跃 manager，必须跳过；可获得锁的目录属于异常退出实例，按清单幂等执行 `shm_unlink` 后删除。
-- 普通 Linux 可直接使用该路径。Kubernetes 生产部署必须把共享 `emptyDir` 挂载到该路径；同一 Pod 内所有协作容器使用同一个 volume，`readOnlyRootFilesystem: true` 时也必须提供此可写挂载：
+- 状态根目录默认为 **`/var/lib/agora/shm-manager`**。启动时逐级创建缺失的父目录和根目录，新建目录权限为 `0700`；已有目录不修改权限或属主。每个成功初始化状态的 manager 使用独立子目录、`flock` 独占锁和 `shm.list`；`add` 尝试登记名称，`remove` 成功 unlink 后尝试删除名称。
+- **状态持久化尽力完成，不阻断媒体业务**：`state_open/open_at` 初始化或回收失败只记录日志，manager 继续启动并跳过后续状态更新；`state_add` 登记失败只记录日志，保留已创建的 SHM 并完成内存写表登记，`add` 仍成功。清单更新失败也不改变 `remove` 的业务结果；实际 SHM 创建、映射、初始化、通知和 unlink 错误仍按各接口规则处理。
+- `agora_shm_manager_start` 尝试扫描状态目录：仍被锁定的目录属于活跃 manager，必须跳过；可获得锁的目录按清单幂等执行 `shm_unlink` 后删除。
+- **降级限制**：状态目录不可用或运行期间被删除时，正常 `remove/close` 仍根据内存写表清理自己创建的 SHM；异常退出后，缺少有效清单的 SHM 可能残留并占用容量，后续创建同名对象可能返回 `EEXIST`。当前不会自动重建状态目录或在同名冲突时删除旧对象。
+- 宿主机进程与同一节点上的 Pod 进程协作时，通过 `hostPath` 把宿主机目录挂载到容器中的相同路径，并确保两个进程的有效 UID 与目录属主匹配。下面的 `DirectoryOrCreate` 由 Kubernetes 创建目录，但不会自动把目录授权给业务用户，部署时仍需设置合适的属主和权限：
 
 ```yaml
 volumeMounts:
   - name: shm-manager-state
-    mountPath: /tmp/agora_shm_manager
+    mountPath: /var/lib/agora/shm-manager
 volumes:
   - name: shm-manager-state
-    emptyDir: {}
+    hostPath:
+      path: /var/lib/agora/shm-manager
+      type: DirectoryOrCreate
 ```
 
-`emptyDir` 会跨同一 Pod 内的容器崩溃和重启保留清单；Pod 被删除时数据随之删除。
+仅在同一个 Pod 内的容器间共享时，也可在该路径挂载同一个 `emptyDir`；它跨容器崩溃和重启保留清单，但 Pod 被删除时清单随之删除。`emptyDir` 不会自动与宿主机进程共享该路径。
 
-非 Pod 部署通常不需要额外挂载：只要 `/tmp` 可写，并且同一机器上的所有 manager 进程看到的是同一个 `/tmp`，即可直接使用。普通进程崩溃不会清除 `/tmp/agora_shm_manager`，后续启动的 manager 可以据此完成异常资源回收。
+非 Pod 部署通常不需要额外挂载。若 `/var/lib/agora` 尚不存在，进程必须有权限在 `/var/lib` 下创建它；普通非 root 用户通常需要部署预先创建目录并设置属主。权限不足或文件系统只读时仅记录状态初始化失败，媒体业务继续运行，异常退出回收能力随之降级。
 
-如果根文件系统只读，则必须为 `/tmp/agora_shm_manager` 提供可写挂载。对于 Docker 等容器部署，如果只要求处理容器内进程崩溃，也不需要额外挂载；如果还要求容器被删除、重新创建后仍能读取旧清单并回收 SHM，则需要挂载宿主机目录或持久 volume，并确保所有协作 manager 共享该路径。
+只读根文件系统需要为 `/var/lib/agora/shm-manager` 提供可写挂载才能保存清单。容器被删除、重新创建后仍需回收旧 SHM 时，应使用与其 SHM 可见范围一致的宿主机存储，并确保协作 manager 看到同一个实际目录。
+
+本次路径调整不会自动迁移旧 `/tmp/agora_shm_manager` 中的清单；升级部署需另行处理旧实例及其资源。
 
 ## 写端流程（API，仅 SHM）
 
@@ -188,6 +194,28 @@ volumes:
 两端 **`shm_name` 与 `payload_size` 必须一致**。
 
 ### manager 示例 `agora_manager_demo`（localsocket）
+
+Manager API 失败时返回 `-errno`，同时保留正数 `errno`；调用方应使用
+`ret < 0` 判断失败，或直接比较 `ret == -ENOENT` 等具体错误码，不再用
+`ret == -1` 判断所有错误。`start/add/remove/write` 成功返回 `0`，`poll`
+成功返回读取字节数或 `0`。`write` 通知失败时，SHM 数据可能已经写入。
+
+Manager 启动成功后，server/client worker 仅在主动调用 `close()` 时退出。
+收包或 keepalive 出错后在锁外等待 **20ms**：明确失效的 socket 进入重建；
+其他 socket 错误连续 **3 次**后重建，正常轮询后清零，`EINTR` 与正常无数据
+不计数。重建失败仍每隔 20ms 重试，保留 manager、读写表、缓存、SHM 映射
+及所有权记录。客户端重建后立即发送 keepalive，服务端等待对端重新登记。
+错误和恢复信息直接输出到 `stderr`，不做限流。
+
+恢复期间，`poll()` 优先返回已有缓存；没有可读数据时返回 `-EAGAIN`
+（包括尚未挂接的名称）。`write()` 仍先写 SHM，通知暂不可发时返回
+`-EAGAIN`，不回滚。恢复后的新通知可继续触发挂接和读帧；不补发通知、不做
+登记同步、不补历史帧，只有一次且已丢失的通知无需自动补偿。
+
+业务层须先停止并等待所有 `write/poll/add/remove` 调用结束，再调用
+`close()`；关闭会唤醒 worker 的等待并回收线程。不要从帧回调中调用
+`close()`。内部正常空闲检查间隔为 10ms，失败等待使用单调时间，避免系统
+时钟调整拉长重试间隔。
 
 ```text
 ./build/agora_manager_demo <port> <server_mode 0|1> <max_clients> <keepalive_ms> <write_shm_name>

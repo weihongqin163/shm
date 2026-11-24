@@ -6,7 +6,9 @@
 #include <limits.h>
 #include <stddef.h>
 
-#define AGORA_SHM_MANAGER_STATE_ROOT "/tmp/agora_shm_manager"
+#ifndef AGORA_SHM_MANAGER_STATE_ROOT
+#define AGORA_SHM_MANAGER_STATE_ROOT "/var/lib/agora/shm-manager"
+#endif
 #define AGORA_SHM_MANAGER_STATE_MAX_NAMES 256u
 
 typedef struct AgoraShmManagerState {

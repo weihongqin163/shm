@@ -7,6 +7,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "agora_localsock.h"
+#include "agora_localsock_internal.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -27,6 +28,7 @@ typedef struct agora_localsock_slot {
 
 struct agora_localsock_server {
   int fd;
+  short poll_events;
   uint32_t keepalive_interval_ms;
   uint64_t timeout_ns;
   size_t max_clients;
@@ -36,8 +38,38 @@ struct agora_localsock_server {
 
 struct agora_localsock_client {
   int fd;
+  short poll_events;
   uint16_t server_port;
 };
+
+short agora_localsock_server_poll_events(const agora_localsock_server *s) {
+  return s->poll_events;
+}
+
+short agora_localsock_client_poll_events(const agora_localsock_client *c) {
+  return c->poll_events;
+}
+
+static int poll_event_error(int fd, short events) {
+  if ((events & POLLNVAL) != 0) {
+    errno = EBADF;
+    return -1;
+  }
+  if ((events & POLLERR) != 0) {
+    int error = 0;
+    socklen_t size = sizeof(error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) != 0) {
+      return -1;
+    }
+    errno = error != 0 ? error : EIO;
+    return -1;
+  }
+  if ((events & POLLHUP) != 0) {
+    errno = EIO;
+    return -1;
+  }
+  return 0;
+}
 
 static void client_peer_addr(const agora_localsock_client *c,
                              struct sockaddr_in *out) {
@@ -311,20 +343,21 @@ int agora_localsock_server_poll(agora_localsock_server *s, int timeout_ms,
     return -1;
   }
   *out_len = 0u;
+  s->poll_events = 0;
   struct pollfd pfd;
   pfd.fd = s->fd;
   pfd.events = POLLIN;
   pfd.revents = 0;
   int pr = poll(&pfd, 1u, timeout_ms);
+  s->poll_events = pfd.revents;
   if (pr < 0) {
+    return -1;
+  }
+  if (poll_event_error(s->fd, pfd.revents) != 0) {
     return -1;
   }
   uint64_t now_ns = 0;
   if (mono_now_ns(&now_ns) != 0) {
-    return -1;
-  }
-  if ((pfd.revents & (POLLERR | POLLNVAL)) != 0) {
-    errno = EIO;
     return -1;
   }
   if ((pfd.revents & POLLIN) != 0) {
@@ -389,6 +422,13 @@ int agora_localsock_client_create(uint16_t server_port,
   }
   c->fd = fd;
   c->server_port = server_port;
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+    int error = errno;
+    agora_localsock_client_destroy(c);
+    errno = error;
+    return -1;
+  }
   *out = c;
   return 0;
 }
@@ -410,11 +450,14 @@ int agora_localsock_client_poll(agora_localsock_client *c, int timeout_ms,
     errno = EINVAL;
     return -1;
   }
+  *out_len = 0;
+  c->poll_events = 0;
   struct pollfd pfd;
   pfd.fd = c->fd;
   pfd.events = POLLIN;
   pfd.revents = 0;
   int pr = poll(&pfd, 1u, timeout_ms);
+  c->poll_events = pfd.revents;
   if (pr < 0) {
     int e = errno;
     errno = e;
@@ -424,8 +467,7 @@ int agora_localsock_client_poll(agora_localsock_client *c, int timeout_ms,
     errno = EAGAIN;
     return -1;
   }
-  if ((pfd.revents & (POLLERR | POLLNVAL)) != 0) {
-    errno = EIO;
+  if (poll_event_error(c->fd, pfd.revents) != 0) {
     return -1;
   }
   struct sockaddr_in src;
@@ -494,9 +536,11 @@ int agora_localsock_client_send_datagram(agora_localsock_client *c,
   client_peer_addr(c, &peer);
   ssize_t nw = sendto(c->fd, buf, total, 0, (struct sockaddr *)&peer,
                       (socklen_t)sizeof(peer));
+  int send_error = errno;
   free(buf);
   if (nw != (ssize_t)total) {
     if (nw < 0) {
+      errno = send_error;
       return -1;
     }
     errno = EIO;

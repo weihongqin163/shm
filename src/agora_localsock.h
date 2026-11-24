@@ -79,6 +79,8 @@ void agora_localsock_server_destroy(agora_localsock_server *s);
  * length (0 if none this call). Caller may call again with timeout_ms == 0
  * to drain additional datagrams. buf and out_len must be non-NULL and cap > 0.
  * Returns 0 on success, -1 on error (errno set).
+ * POLLNVAL reports EBADF; POLLERR reports SO_ERROR or EIO if unset; POLLHUP
+ * reports EIO. The caller must serialize poll/send/destroy on this server.
  */
 int agora_localsock_server_poll(agora_localsock_server *s, int timeout_ms,
                                 void *buf, size_t cap, size_t *out_len);
@@ -87,7 +89,7 @@ int agora_localsock_server_poll(agora_localsock_server *s, int timeout_ms,
  * Sends one datagram (header + payload) to every tracked peer. msg_type is
  * written into the localsock header; payload_len follows payload size.
  * Returns 0 if there are no peers; otherwise 0 if all sendto calls succeed, or
- * -1 on first failure (errno set). Serialized with server_poll recv path.
+ * -1 on first failure (errno set). Caller serializes with server_poll/destroy.
  */
 int agora_localsock_server_send_datagram(agora_localsock_server *s,
                                          uint16_t msg_type, const void *payload,
@@ -112,7 +114,9 @@ void agora_localsock_client_destroy(agora_localsock_client *c);
  * Waits up to timeout_ms for one datagram. On success writes full UDP payload
  * (localsock header + body) into buf and sets *out_len. timeout_ms < 0 means
  * wait indefinitely. Returns -1 on error; EAGAIN if no datagram before timeout
- * (when timeout_ms >= 0). Serialized with send_keepalive/send_data via mutex.
+ * (when timeout_ms >= 0). POLLNVAL reports EBADF; POLLERR reports SO_ERROR or
+ * EIO if unset; POLLHUP reports EIO. Socket is nonblocking; caller serializes
+ * poll/send/destroy.
  */
 int agora_localsock_client_poll(agora_localsock_client *c, int timeout_ms,
                                 void *buf, size_t cap, size_t *out_len);
@@ -132,7 +136,7 @@ int agora_localsock_client_send_data(agora_localsock_client *c,
 
 /**
  * Sends one datagram with arbitrary msg_type (header + payload). payload may
- * be NULL when payload_len is 0. Serialized with poll/keepalive/send_data.
+ * be NULL when payload_len is 0. Caller serializes with poll/keepalive/destroy.
  */
 int agora_localsock_client_send_datagram(agora_localsock_client *c,
                                          uint16_t msg_type, const void *payload,

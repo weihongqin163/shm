@@ -103,6 +103,55 @@ static int write_file(const char *path, const char *contents) {
   return 0;
 }
 
+static int test_missing_parent_directories_are_created(void) {
+  char base[] = "/tmp/agora_shm_state_test_XXXXXX";
+  char parent[PATH_MAX];
+  char root[PATH_MAX];
+  CHECK(mkdtemp(base) != NULL);
+  CHECK(snprintf(parent, sizeof(parent), "%s/agora", base) > 0);
+  CHECK(snprintf(root, sizeof(root), "%s/shm-manager", parent) > 0);
+  CHECK(access(parent, F_OK) == -1 && errno == ENOENT);
+
+  AgoraShmManagerState state;
+  CHECK(agora_shm_manager_state_open_at(&state, root) == 0);
+  struct stat st;
+  CHECK(lstat(parent, &st) == 0 && S_ISDIR(st.st_mode));
+  CHECK((st.st_mode & 0777) == 0700);
+  CHECK(lstat(root, &st) == 0 && S_ISDIR(st.st_mode));
+  CHECK((st.st_mode & 0777) == 0700);
+  CHECK(agora_shm_manager_state_add(&state, "/nested_state") == 0);
+  CHECK(manifest_contains(state.dir_path, "/nested_state") == 1);
+  CHECK(agora_shm_manager_state_remove(&state, "/nested_state") == 0);
+  agora_shm_manager_state_close(&state);
+  CHECK(rmdir(root) == 0);
+  CHECK(rmdir(parent) == 0);
+  CHECK(rmdir(base) == 0);
+  return 0;
+}
+
+static int test_parent_file_and_root_symlink_are_rejected(void) {
+  char base[] = "/tmp/agora_shm_state_test_XXXXXX";
+  char file[PATH_MAX];
+  char root[PATH_MAX];
+  char link_path[PATH_MAX];
+  CHECK(mkdtemp(base) != NULL);
+  CHECK(snprintf(file, sizeof(file), "%s/blocked", base) > 0);
+  CHECK(snprintf(root, sizeof(root), "%s/child", file) > 0);
+  CHECK(write_file(file, "") == 0);
+  AgoraShmManagerState state;
+  CHECK(agora_shm_manager_state_open_at(&state, root) == -1);
+  CHECK(errno == ENOTDIR && state.lock_fd == -1);
+  CHECK(unlink(file) == 0);
+
+  CHECK(snprintf(link_path, sizeof(link_path), "%s/state-link", base) > 0);
+  CHECK(symlink(base, link_path) == 0);
+  CHECK(agora_shm_manager_state_open_at(&state, link_path) == -1);
+  CHECK(errno == ENOTDIR && state.lock_fd == -1);
+  CHECK(unlink(link_path) == 0);
+  CHECK(rmdir(base) == 0);
+  return 0;
+}
+
 static int test_add_remove_and_close_manifest(void) {
   char root[] = "/tmp/agora_shm_state_test_XXXXXX";
   CHECK(mkdtemp(root) != NULL);
@@ -266,6 +315,8 @@ static int test_directory_already_being_removed_is_ignored(void) {
 }
 
 int main(void) {
+  CHECK(test_missing_parent_directories_are_created() == 0);
+  CHECK(test_parent_file_and_root_symlink_are_rejected() == 0);
   CHECK(test_add_remove_and_close_manifest() == 0);
   CHECK(test_live_manager_is_not_recovered_in_same_process() == 0);
   CHECK(test_dead_owner_is_recovered() == 0);

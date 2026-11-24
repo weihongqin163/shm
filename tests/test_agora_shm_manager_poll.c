@@ -190,7 +190,7 @@ static ssize_t wait_for_poll(TestFixture *f, AgoraShmIpcHeader *header,
       return n;
     }
     if (errno != ENOENT) {
-      return -1;
+      return n;
     }
     sleep_ms(10);
   }
@@ -204,7 +204,7 @@ static int wait_for_missing_read_entry(AgoraShmManager *manager,
   char byte;
   for (unsigned i = 0u; i < 100u; ++i) {
     errno = 0;
-    if (agora_shm_manager_poll(manager, shm_name, &header, &byte, 1u) == -1 &&
+    if (agora_shm_manager_poll(manager, shm_name, &header, &byte, 1u) == -ENOENT &&
         errno == ENOENT) {
       return 0;
     }
@@ -420,6 +420,50 @@ static int test_media_type_is_locked(void) {
   return 0;
 }
 
+static int test_manager_error_codes(void) {
+  AgoraShmManager *manager = NULL;
+  errno = 0;
+  CHECK(agora_shm_manager_start(NULL, 0u, true, 1u, 1000u, NULL,
+                                TEST_READ_CAP, &manager) == -EINVAL);
+  CHECK(errno == EINVAL);
+  CHECK(manager == NULL);
+  errno = 0;
+  CHECK(agora_shm_manager_add(NULL, "/missing", 16u) == -EINVAL);
+  CHECK(errno == EINVAL);
+  errno = 0;
+  CHECK(agora_shm_manager_remove(NULL, "/missing") == -EINVAL);
+  CHECK(errno == EINVAL);
+
+  TestFixture f;
+  CHECK(fixture_open(&f, 16u) == 0);
+  AgoraShmIpcFrameMeta meta = make_meta(&f, AGORA_SHM_MEDIA_VIDEO);
+  char data[17] = {0};
+  errno = 0;
+  CHECK(agora_shm_manager_add(f.writer, f.shm_name, 16u) == -EEXIST);
+  CHECK(errno == EEXIST);
+  errno = 0;
+  CHECK(agora_shm_manager_write(NULL, f.shm_name, data, 1u, &meta) == -EINVAL);
+  CHECK(errno == EINVAL);
+  errno = 0;
+  CHECK(agora_shm_manager_write(f.writer, "/missing", data, 1u, &meta) ==
+        -ENOENT);
+  CHECK(errno == ENOENT);
+  errno = 0;
+  CHECK(agora_shm_manager_write(f.writer, f.shm_name, NULL, 1u, &meta) ==
+        -EINVAL);
+  CHECK(errno == EINVAL);
+  errno = 0;
+  CHECK(agora_shm_manager_write(f.writer, f.shm_name, data, sizeof(data),
+                                &meta) == -EMSGSIZE);
+  CHECK(errno == EMSGSIZE);
+  errno = 0;
+  CHECK(agora_shm_manager_remove(f.writer, "/missing") == -ENOENT);
+  CHECK(errno == ENOENT);
+  CHECK(write_frame(&f, data, 1u, AGORA_SHM_MEDIA_VIDEO) == 0);
+  fixture_close(&f);
+  return 0;
+}
+
 static int test_poll_errors_and_empty_entry(void) {
   uint16_t port = reserve_udp_port();
   CHECK(port != 0u);
@@ -429,34 +473,34 @@ static int test_poll_errors_and_empty_entry(void) {
   AgoraShmIpcHeader header;
   char out[8];
   errno = 0;
-  CHECK(poll_api(NULL, "/missing", &header, out, sizeof(out)) == -1);
+  CHECK(poll_api(NULL, "/missing", &header, out, sizeof(out)) == -EINVAL);
   CHECK(errno == EINVAL);
   errno = 0;
-  CHECK(poll_api(callback_manager, NULL, &header, out, sizeof(out)) == -1);
+  CHECK(poll_api(callback_manager, NULL, &header, out, sizeof(out)) == -EINVAL);
   CHECK(errno == EINVAL);
   errno = 0;
-  CHECK(poll_api(callback_manager, "", &header, out, sizeof(out)) == -1);
+  CHECK(poll_api(callback_manager, "", &header, out, sizeof(out)) == -EINVAL);
   CHECK(errno == EINVAL);
   errno = 0;
-  CHECK(poll_api(callback_manager, "/missing", NULL, out, sizeof(out)) == -1);
+  CHECK(poll_api(callback_manager, "/missing", NULL, out, sizeof(out)) == -EINVAL);
   CHECK(errno == EINVAL);
   errno = 0;
   CHECK(poll_api(callback_manager, "/missing", &header, NULL, sizeof(out)) ==
-        -1);
+        -EINVAL);
   CHECK(errno == EINVAL);
   errno = 0;
-  CHECK(poll_api(callback_manager, "/missing", &header, out, 0u) == -1);
+  CHECK(poll_api(callback_manager, "/missing", &header, out, 0u) == -EINVAL);
   CHECK(errno == EINVAL);
   errno = 0;
   CHECK(poll_api(callback_manager, "/missing", &header, out, sizeof(out)) ==
-        -1);
+        -ENOTSUP);
   CHECK(errno == ENOTSUP);
   agora_shm_manager_close(callback_manager);
 
   TestFixture f;
   CHECK(fixture_open(&f, 1024u) == 0);
   errno = 0;
-  CHECK(poll_api(f.receiver, "/unknown", &header, out, sizeof(out)) == -1);
+  CHECK(poll_api(f.receiver, "/unknown", &header, out, sizeof(out)) == -ENOENT);
   CHECK(errno == ENOENT);
 
   uint8_t invalid[4] = {1u, 2u, 3u, 4u};
@@ -514,7 +558,7 @@ static int test_video_enobufs_preserves_frame(void) {
   char expected_small[sizeof(small)];
   memcpy(expected_small, small, sizeof(small));
   ssize_t n = wait_for_poll(&f, &header, small, sizeof(small));
-  CHECK(n == -1);
+  CHECK(n == -ENOBUFS);
   CHECK(errno == ENOBUFS);
   CHECK(memcmp(&header, &expected_header, sizeof(header)) == 0);
   CHECK(memcmp(small, expected_small, sizeof(small)) == 0);
@@ -563,7 +607,7 @@ static int test_callback_mode_remains_compatible(void) {
   AgoraShmIpcHeader header;
   char out[sizeof(data)];
   errno = 0;
-  CHECK(poll_api(f.receiver, f.shm_name, &header, out, sizeof(out)) == -1);
+  CHECK(poll_api(f.receiver, f.shm_name, &header, out, sizeof(out)) == -ENOTSUP);
   CHECK(errno == ENOTSUP);
   fixture_close(&f);
   return 0;
@@ -582,7 +626,7 @@ static int test_remove_discards_poll_entry(void) {
   CHECK(agora_shm_manager_remove(f.receiver, f.shm_name) == 0);
   CHECK(shm_exists(f.shm_name) == 1);
   errno = 0;
-  CHECK(poll_api(f.receiver, f.shm_name, &header, out, sizeof(out)) == -1);
+  CHECK(poll_api(f.receiver, f.shm_name, &header, out, sizeof(out)) == -ENOENT);
   CHECK(errno == ENOENT);
   fixture_close(&f);
   return 0;
@@ -788,6 +832,7 @@ static int test_poll_frames_are_stable_under_concurrent_writes(void) {
 }
 
 int main(void) {
+  CHECK(test_manager_error_codes() == 0);
   CHECK(test_poll_errors_and_empty_entry() == 0);
   CHECK(test_audio_append_and_header() == 0);
   CHECK(test_audio_keeps_latest_60ms() == 0);

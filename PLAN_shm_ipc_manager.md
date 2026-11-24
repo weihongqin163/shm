@@ -28,7 +28,7 @@ typedef void (*agora_shm_manager_on_frame_fn)(
     void *user);
 
 /**
- * port: UDP 端口（127.0.0.1），必须 > 0；port==0 非法，返回 -1 且 errno=EINVAL。
+ * port: UDP 端口（127.0.0.1），必须 > 0；port==0 非法，返回 -EINVAL 且 errno=EINVAL。
  * server_mode: true=localsocket server bind port；false=client connect 127.0.0.1:port。
  * localsock_max_clients: 仅 server 模式传入 `agora_localsock_server_create` 的 max_clients；client 模式可忽略（实现传占位或忽略）。
  * localsock_keepalive_ms: 传入 server 的 keepalive_interval_ms（5× 超时）；与 client 侧线程内 500ms keepalive **独立**（见 3.2）。
@@ -76,9 +76,25 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
 ### 3.2 工作线程与 client keep-alive（定稿）
 
 - **一条** worker `pthread`。
-- **Server 模式**：循环调用 **`agora_localsock_server_poll`**（带超时），收到数据后进入 **`onIPCSignal`** 链路（见 3.4）。
+- **Server 模式**：在 transport 锁内非阻塞调用 **`agora_localsock_server_poll`**，收到数据后释锁进入 **`onIPCSignal`** 链路（见 3.4）。无数据时在锁外等待 10ms；client 采用相同的非阻塞收包与空闲等待方式。
 - **Client 模式**：循环 **`agora_localsock_client_poll`**（见 [`PLAN_localsocket.md`](PLAN_localsocket.md) 新增 API）+ 定时逻辑：除 poll 外，**每 500ms** 调用一次 **`agora_localsock_client_send_keepalive`**（由 manager 线程承担，**不**要求业务再驱动；与「独立使用 localsock 客户端时由业务发 keepalive」可并存——见 localsock PLAN 备注）。
 - **`localsock_keepalive_ms`**：仅用于 **server** 侧 peer 超时（`5×`）；**不**作为上述 500ms 的来源。
+
+### 3.2.1 通道自动恢复
+
+- worker 启动成功后，仅主动 `close()` 才退出。接收缓冲在启动线程前分配。
+- 实际收包错误后在锁外等待 20ms；`EBADF/ENOTSOCK`（含 `POLLNVAL`）
+  触发重建，其他 socket 错误连续 3 次后重建。正常轮询后清零，正常超时、
+  `EINTR`、暂时无数据不计数。keepalive 失败同样等待、重试并在必要时重建。
+- 只替换 localsock，保留端口、server 配置、SHM 映射、读写表、缓存和持久化
+  所有权。失败重建每隔 20ms 重试，客户端重建后立即发送 keepalive。
+- `poll()` 在恢复期间先消费缓存，没有可读数据则返回 `-EAGAIN`；正常情况下
+  未挂接仍为 `-ENOENT`，缓存为空仍为 `0`。`write()` 先写 SHM，恢复期间通知
+  返回 `-EAGAIN`，不回滚。所有 manager 失败返回 `-errno` 并设置 `errno`。
+- 日志输出到 stderr，不限流，不持业务锁或 transport 锁输出。
+- 上层先停止并等待业务 API 调用结束再 `close()`；close 唤醒等待、join worker
+  后再释放资源。不得从帧回调中 close。等待使用单调时间。
+- 不增加公开恢复/状态 API，不补发通知、不做登记同步、不补历史帧。
 
 ### 3.3 `onIPCSignal`（实现内 static，不进头文件）
 
@@ -97,7 +113,7 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
 ### 3.6 `agora_shm_manager_add` / `agora_shm_manager_remove`
 
 - **读表 / 写表**：内部 **`read_entries`**（UDP 自动附着读，最多 256）与 **`write_entries`**（`add` 登记的写端创建，最多 256）分离；**`close`** 时两套表项均 **`agora_shm_ipc_close`**。
-- **`add`**：`agora_shm_ipc_open(shm_name, max_payload_size, is_creator=1)` + **`agora_shm_ipc_writer_session_begin`**，并在成功返回前把名称写入 `/tmp/agora_shm_manager` 下本 manager 的清单；`max_payload_size == 0` → `EINVAL`；写表或读表已存在同名 → **`EEXIST`**；写表满 → **`ENOMEM`**；其它失败透传 **`errno`**。
+- **`add`**：`agora_shm_ipc_open(shm_name, max_payload_size, is_creator=1)` + **`agora_shm_ipc_writer_session_begin`**，并尽力把名称写入 `/var/lib/agora/shm-manager` 下本 manager 的清单；状态登记失败仅记录日志，保留 SHM 并完成内存写表登记，不回滚、不使媒体创建失败。`max_payload_size == 0` → `EINVAL`；写表或读表已存在同名 → **`EEXIST`**；写表满 → **`ENOMEM`**；实际 SHM 失败透传 **`errno`**。
 - **`remove`**：先查写表；命中后发送 REMOVECMD、close、unlink 并删除清单记录。否则只从读表移除，不发送信令且不 unlink；两处都无 → **`ENOENT`**。
 - **UDP 派发**：若 `shm_name` 已在写表登记，**不再**为该名自动打开读附着（避免同 manager 内读写双持同一名的歧义）。
 
@@ -110,8 +126,8 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
 
 - **`msg_type == AGORA_LOCALSOCK_MSG_REMOVECMD`（4）**：UDP 负载为固定 64 字节 SHM 名称。接收侧严格校验长度和 NUL 结尾，只 close 并清空同名 `read_entry`；没有读槽时幂等忽略，绝不清理写槽或调用 `shm_unlink`。
 - **所有权**：谁调用 `agora_shm_manager_add` 创建写 SHM，谁负责在 remove/close 时发送 REMOVECMD 并 unlink。读侧只释放自己的映射。
-- **磁盘清单**：每个 manager 在 `/tmp/agora_shm_manager` 下拥有独立状态目录和 `flock` 锁。start 跳过仍锁定的活跃实例，对失锁清单逐项执行 `shm_unlink`；close 成功清理写 SHM 后删除自己的状态目录。
-- **多进程 / Pod**：同端口多个 client manager 通过独立目录隔离。Pod 多容器必须把同一个 `emptyDir` 挂载到 `/tmp/agora_shm_manager`，以便容器崩溃重启后仍能读取清单。
+- **磁盘清单**：尽力在 `/var/lib/agora/shm-manager` 下创建独立状态目录和 `flock` 锁。start 逐级创建缺失的父目录和根目录，新建目录权限为 `0700`，保留已有目录权限；跳过仍锁定的活跃实例，对失锁清单逐项执行 `shm_unlink`。状态初始化/回收失败仅记录日志，继续启动并跳过后续状态更新。remove 清单更新失败仅记录日志；close 仍清理所有内存写表中的 SHM，清单更新失败时尽力保留已有恢复记录。缺少有效清单的对象在异常退出后可能残留，且同名创建可能返回 `EEXIST`。
+- **多进程 / Pod**：同端口多个 client manager 通过独立目录隔离。宿主机进程与 Pod 协作时，通过 `hostPath` 共享同一节点的 `/var/lib/agora/shm-manager`，并配置匹配的有效 UID 和写权限；仅同一 Pod 内多容器可使用共享 `emptyDir`。无创建权限时由部署预先创建并授权。旧 `/tmp/agora_shm_manager` 清单不自动迁移。
 
 ## 四、与旧版差异（摘要）
 

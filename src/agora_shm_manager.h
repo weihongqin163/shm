@@ -16,6 +16,12 @@
 
 typedef struct AgoraShmManager AgoraShmManager;
 
+/*
+ * All fallible manager APIs return -errno on failure and also set errno to the
+ * positive error code. Test for a negative return, rather than exactly -1.
+ * start/add/remove/write return 0 on success; poll returns bytes or 0.
+ */
+
 typedef void (*agora_shm_manager_on_frame_fn)(const char *shm_name,
                                               const void *payload, size_t len,
                                               const AgoraShmIpcHeader *hdr,
@@ -39,10 +45,17 @@ typedef void (*agora_shm_manager_on_frame_fn)(const char *shm_name,
  * @note In on_frame, hdr and payload are valid only until the callback returns;
  *       payload points into the SHM mmap.
  *
- * Before creating the worker, start recovers creator-owned SHM objects left in
- * unlocked state directories by abnormally terminated managers. Live managers
- * retain an exclusive state-file lock and are never recovered by another
- * manager.
+ * Before creating the worker, start attempts to recover creator-owned SHM
+ * objects left in unlocked state directories by terminated managers. State
+ * initialization/recovery errors are logged and do not prevent startup; that
+ * manager then runs without persistent ownership tracking. Live managers with
+ * an intact state-file lock are skipped by recovery.
+ *
+ * Once started, the worker exits only on close. Receive/keepalive errors retry
+ * after 20 ms; an invalid socket or three consecutive other socket errors
+ * rebuild only the transport, retaining all SHM entries and ownership. Failed
+ * rebuilds retry until close. Errors/recovery are logged to stderr without
+ * rate limiting. Lost notifications and historical frames are not replayed.
  */
 int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
                             uint16_t port, bool server_mode,
@@ -56,6 +69,9 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
  * best-effort REMOVECMD and calls agora_shm_ipc_unlink after close; removes the
  * manager's persistent state files after successful cleanup; destroys
  * localsock and frees the manager.
+ * Callers must stop new business API calls and wait for in-flight calls to
+ * finish before close; never call close from on_frame. Close interrupts worker
+ * retry/idle waits and joins recovery before releasing resources.
  */
 void agora_shm_manager_close(AgoraShmManager *m);
 
@@ -63,8 +79,11 @@ void agora_shm_manager_close(AgoraShmManager *m);
  * Registers a writer-side SHM IPC: creates the object with
  * agora_shm_ipc_open(shm_name, max_payload_size, is_creator=1) and
  * agora_shm_ipc_writer_session_begin. max_payload_size must be non-zero
- * (EINVAL). Returns -1 with errno EEXIST if shm_name is already registered in
+ * (EINVAL). Returns -EEXIST and sets errno if shm_name is already registered in
  * the write table or already present in the read (auto-attach) table.
+ * Persistent ownership registration is best effort: a state error is logged,
+ * but the newly created SHM remains registered in the live write table and add
+ * succeeds. Such objects may not be recoverable after abnormal process exit.
  */
 int agora_shm_manager_add(AgoraShmManager *m, const char *shm_name,
                           size_t max_payload_size);
@@ -73,9 +92,10 @@ int agora_shm_manager_add(AgoraShmManager *m, const char *shm_name,
  * Removes shm_name from the write table first. A write removal sends REMOVECMD,
  * closes and unlinks the creator-owned SHM, then removes its persistent state
  * record. If not found in the write table, removes only the local read entry;
- * read removal never sends REMOVECMD or unlinks SHM. Returns -1 with errno
- * ENOENT if absent in both. Local write cleanup still runs if notification
- * fails, and the first notification or cleanup error is returned.
+ * read removal never sends REMOVECMD or unlinks SHM. Returns -ENOENT and sets
+ * errno if absent in both. Local write cleanup still runs if notification
+ * fails, and the first notification or SHM cleanup error is returned.
+ * Persistent state-update errors are logged and do not fail removal.
  */
 int agora_shm_manager_remove(AgoraShmManager *m, const char *shm_name);
 
@@ -83,7 +103,10 @@ int agora_shm_manager_remove(AgoraShmManager *m, const char *shm_name);
  * Writes to a SHM IPC registered in the write table, then sends a WRITECMD
  * localsocket datagram (header + meta). meta must be non-NULL (EINVAL).
  * ENOENT if shm_name is not in the write table. If server mode has no UDP
- * peers yet, signaling succeeds with return 0.
+ * peers yet, signaling succeeds with return 0. Notification failure returns
+ * -errno even though the SHM data has already been written.
+ * While the local transport is recovering, SHM is still written but signaling
+ * returns -EAGAIN and sets errno=EAGAIN. There is no rollback or automatic replay.
  */
 int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
                             const void *data, size_t len,
@@ -97,8 +120,13 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
  * On a positive return, header is the latest accepted frame header with
  * header->data_len set to the returned byte count.
  *
- * Returns copied bytes, 0 when the entry has no buffered data, or -1 with errno
- * set to EINVAL, ENOTSUP, ENOENT, ENOBUFS, or EOVERFLOW as applicable.
+ * Buffered data remains readable during transport recovery. When no data can
+ * be returned during recovery (including a missing entry), returns -EAGAIN
+ * with errno=EAGAIN. In healthy operation a missing entry returns -ENOENT and
+ * an empty entry returns 0. This API reads the cache, not SHM directly.
+ *
+ * Other failures return -errno with errno set to EINVAL, ENOTSUP, ENOBUFS, or
+ * EOVERFLOW as applicable. These errors do not consume the buffered data.
  */
 ssize_t agora_shm_manager_poll(AgoraShmManager *m, const char *shm_name,
                                AgoraShmIpcHeader *header, char *out,
