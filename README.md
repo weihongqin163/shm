@@ -79,6 +79,26 @@ make clean && make all
 - **`agora_shm_manager_close`**：停止 worker；对写槽发送 best-effort **REMOVECMD**，关闭全部读/写 IPC 并 unlink 创建方写 SHM；销毁 localsocket，成功清理后删除本 manager 的磁盘状态目录。
 - **设计细节**：[`PLAN_shm_ipc_manager.md`](PLAN_shm_ipc_manager.md)；localsocket 协议：[`PLAN_localsocket.md`](PLAN_localsocket.md)。
 
+### manager 音频 burst 写入
+
+`agora_shm_manager_write` 对音频先拷贝 payload 和 metadata 到每个 `shm_name`
+独立的 pre-buffer。返回 `0` 表示已入队，调用方可立即复用原缓冲区；实际写入和
+通知由已有 worker 异步完成。音频须为有效 PCM：正数采样率、声道数、可被 8
+整除的正数位深，且非空 payload 包含完整的交错采样点。
+
+- 首帧进入空队列后等待 **10 ms** 合并窗口；worker 使用单调时间调度，每个
+  截止时间最多合并 **4 个**连续且 metadata 一致的输入帧，一次写 SHM、通知一次。
+  未合并的帧保留至下一周期；worker 延迟后不连续补写。
+- 合并总长度不超过 `add(max_payload_size)` 已分配的 SHM payload。希望合并
+  4 帧时，应预留至少 4 帧容量，并确保接收端 `max_read_cap` 足够；容量较小则
+  每次合并更少帧，无需修改 SHM 协议。采样率/声道数/位深变化时清除旧格式队列。
+- 为限制实时语音积压，发送队列最多保存 **200 ms PCM / 64 个输入帧**，超限
+  丢弃最旧完整帧。单次输入超过 200 ms 但能放入 SHM 时，仍可单独保留。
+  `remove/close` 丢弃并释放尚未发送的音频。
+- 视频继续立即覆盖写入。音频异步通知失败会记录日志，不会通过原 `write`
+  返回，也不重放已提交批次。定时合并缓解 burst；单槽 SHM 和 UDP 通知仍不保证
+  每批必达。
+
 ### manager poll 模式
 
 启动时将 `on_frame` 传为 `NULL`，再用调用方分配的 `header` 和 `out` 接收数据：
@@ -101,7 +121,7 @@ if (n > 0) {
 }
 ```
 
-- 音频按到达顺序追加，最多保留最新 **60 ms**（容量按帧元数据中的采样率、声道数和位深计算）；poll 可以分段取走数据，并将剩余数据前移。
+- 音频按到达顺序追加，最多保留最新 **200 ms**（容量按帧元数据中的采样率、声道数和位深计算）；poll 可以分段取走数据，并将剩余数据前移。格式变化时清空旧缓存并重算容量。
 - 视频只保留最新完整帧；`out` 容量不足时返回 `-1/ENOBUFS`，该帧保留供扩大缓冲后重试。
 - 找到读条目但暂无缓存数据时返回 `0`，不修改 `header` 和 `out`；找不到 `shm_name` 时返回 `-1/ENOENT`。
 - 音频聚合时输出 header 来自最新接收帧；所有成功 poll 都将 `header.data_len` 改为本次返回字节数。
@@ -198,7 +218,8 @@ volumes:
 Manager API 失败时返回 `-errno`，同时保留正数 `errno`；调用方应使用
 `ret < 0` 判断失败，或直接比较 `ret == -ENOENT` 等具体错误码，不再用
 `ret == -1` 判断所有错误。`start/add/remove/write` 成功返回 `0`，`poll`
-成功返回读取字节数或 `0`。`write` 通知失败时，SHM 数据可能已经写入。
+成功返回读取字节数或 `0`。音频 `write` 成功表示已拷贝入队，发送错误异步记录；
+视频 `write` 通知失败时，SHM 数据可能已经写入。
 
 Manager 启动成功后，server/client worker 仅在主动调用 `close()` 时退出。
 收包或 keepalive 出错后在锁外等待 **20ms**：明确失效的 socket 进入重建；
@@ -208,7 +229,8 @@ Manager 启动成功后，server/client worker 仅在主动调用 `close()` 时�
 错误和恢复信息直接输出到 `stderr`，不做限流。
 
 恢复期间，`poll()` 优先返回已有缓存；没有可读数据时返回 `-EAGAIN`
-（包括尚未挂接的名称）。`write()` 仍先写 SHM，通知暂不可发时返回
+（包括尚未挂接的名称）。音频 `write()` 仍可入队，worker 继续定时写 SHM，
+通知错误异步记录；视频 `write()` 仍先写 SHM，通知暂不可发时返回
 `-EAGAIN`，不回滚。恢复后的新通知可继续触发挂接和读帧；不补发通知、不做
 登记同步、不补历史帧，只有一次且已丢失的通知无需自动补偿。
 

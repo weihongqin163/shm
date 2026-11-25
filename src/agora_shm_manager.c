@@ -31,7 +31,10 @@
 #define AGORA_SHM_MANAGER_MAX_ENTRIES 256
 #define AGORA_SHM_MANAGER_DEFAULT_READ_CAP (256u * 1024u)
 #define AGORA_SHM_MANAGER_UDP_CAP 2048u
-#define AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY_IN_MS (60u)
+#define AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY_IN_MS (200u)
+#define AGORA_SHM_MANAGER_AUDIO_FLUSH_NS 10000000ull
+#define AGORA_SHM_MANAGER_AUDIO_BATCH_FRAMES 4u
+#define AGORA_SHM_MANAGER_AUDIO_QUEUE_FRAMES 64u
 #define AGORA_SHM_MANAGER_ERROR_WAIT_MS 20u
 #define AGORA_SHM_MANAGER_IDLE_WAIT_MS 10u
 #define AGORA_SHM_MANAGER_REBUILD_ERRORS 3u
@@ -54,11 +57,25 @@ typedef struct AgoraShmManagerReadEntry {
   AgoraShmIpcHeader latest_header;
 } AgoraShmManagerReadEntry;
 
+typedef struct AgoraShmManagerAudioFrame {
+  struct AgoraShmManagerAudioFrame *next;
+  size_t len;
+  AgoraShmIpcFrameMeta meta;
+  uint8_t data[];
+} AgoraShmManagerAudioFrame;
+
 typedef struct AgoraShmManagerWriteEntry {
   int in_use;
   int removing;
   char shm_name[AGORA_SHM_IPC_SHM_NAME_BYTES];
   AgoraShmIpc ipc;
+  AgoraShmManagerAudioFrame *audio_head;
+  AgoraShmManagerAudioFrame *audio_tail;
+  size_t audio_bytes;
+  unsigned audio_count;
+  uint64_t audio_flush_ns;
+  uint8_t *audio_scratch;
+  size_t audio_scratch_capacity;
 } AgoraShmManagerWriteEntry;
 
 struct AgoraShmManager {
@@ -94,6 +111,33 @@ static int mono_now_ns(uint64_t *out) {
   }
   *out = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
   return 0;
+}
+
+/* PCM capacity rounded down to whole interleaved samples, without int overflow. */
+static int manager_audio_capacity(const AgoraShmIpcFrameMeta *meta,
+                                   size_t *sample_bytes, size_t *capacity) {
+  if (meta->sample_rate <= 0 || meta->channels <= 0 || meta->bits <= 0 ||
+      meta->bits % 8 != 0) {
+    return -EINVAL;
+  }
+  const uint64_t stride = (uint64_t)meta->channels * (uint64_t)(meta->bits / 8);
+  const uint64_t samples = (uint64_t)meta->sample_rate *
+                          AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY_IN_MS / 1000u;
+  if (samples == 0) {
+    return -EINVAL;
+  }
+  if (stride > SIZE_MAX || samples > SIZE_MAX / stride) {
+    return -EOVERFLOW;
+  }
+  *sample_bytes = (size_t)stride;
+  *capacity = (size_t)(samples * stride);
+  return 0;
+}
+
+static int manager_audio_same_format(const AgoraShmIpcFrameMeta *a,
+                                      const AgoraShmIpcFrameMeta *b) {
+  return a->sample_rate == b->sample_rate && a->channels == b->channels &&
+         a->bits == b->bits;
 }
 
 static int find_read_entry_by_name(AgoraShmManager *m, const char *shm_name) {
@@ -153,23 +197,26 @@ static void manager_buffer_frame(AgoraShmManager *m,
     return;
   }
 
-  if (e->media_type_valid == 0) {
-    size_t capacity = m->read_cap;
-
-    // update to only 60ms for audio
-    if (media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO) {
-      capacity = header->frame_meta.sample_rate * header->frame_meta.channels *
-                 header->frame_meta.bits / 8 *
-                 AGORA_SHM_MANAGER_AUDIO_BUFFER_CAPACITY_IN_MS / 1000;
-    } else {
-      capacity = m->read_cap;
+  size_t capacity = m->read_cap;
+  if (media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO) {
+    size_t sample_bytes;
+    if (manager_audio_capacity(&header->frame_meta, &sample_bytes,
+                                &capacity) != 0) {
+      return;
     }
+  }
+  if (e->media_type_valid == 0 ||
+      (media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO &&
+       !manager_audio_same_format(&e->latest_header.frame_meta,
+                                   &header->frame_meta))) {
     uint8_t *buffer = (uint8_t *)malloc(capacity);
     if (buffer == NULL) {
       return;
     }
+    free(e->buffer);
     e->buffer = buffer;
     e->buffer_capacity = capacity;
+    e->data_len = 0;
     e->media_type = media_type;
     e->media_type_valid = 1;
   }
@@ -221,11 +268,97 @@ static int find_free_write_slot(AgoraShmManager *m) {
   return -1;
 }
 
+static void manager_audio_pop(AgoraShmManagerWriteEntry *e) {
+  AgoraShmManagerAudioFrame *frame = e->audio_head;
+  e->audio_head = frame->next;
+  e->audio_bytes -= frame->len;
+  --e->audio_count;
+  if (e->audio_head == NULL) {
+    e->audio_tail = NULL;
+  }
+  free(frame);
+}
+
+static void manager_audio_clear(AgoraShmManagerWriteEntry *e) {
+  while (e->audio_head != NULL) {
+    manager_audio_pop(e);
+  }
+  e->audio_flush_ns = 0;
+}
+
 static void clear_write_entry(AgoraShmManagerWriteEntry *e) {
+  manager_audio_clear(e);
+  free(e->audio_scratch);
   if (e->in_use != 0) {
     agora_shm_ipc_close(&e->ipc);
   }
   memset(e, 0, sizeof(*e));
+}
+
+static int manager_audio_same_meta(const AgoraShmIpcFrameMeta *a,
+                                    const AgoraShmIpcFrameMeta *b) {
+  return manager_audio_same_format(a, b) &&
+         a->media_type == b->media_type && a->stream_type == b->stream_type &&
+         a->width == b->width && a->height == b->height &&
+         a->orientation == b->orientation &&
+         strncmp(a->user_id, b->user_id, sizeof(a->user_id)) == 0 &&
+         strncmp(a->shm_name, b->shm_name, sizeof(a->shm_name)) == 0;
+}
+
+/* Called with m->lock held. Ownership transfers only on a zero return. */
+static int manager_audio_enqueue(AgoraShmManagerWriteEntry *e,
+                                  const void *data, size_t len,
+                                  const AgoraShmIpcFrameMeta *meta) {
+  size_t sample_bytes, capacity;
+  int rc = manager_audio_capacity(meta, &sample_bytes, &capacity);
+  if (rc != 0) {
+    return rc;
+  }
+  if (len == 0 || len % sample_bytes != 0) {
+    return -EINVAL;
+  }
+  if (len > SIZE_MAX - sizeof(AgoraShmManagerAudioFrame)) {
+    return -EOVERFLOW;
+  }
+  uint64_t now_ns;
+  rc = mono_now_ns(&now_ns);
+  if (rc != 0) {
+    return rc;
+  }
+  AgoraShmManagerAudioFrame *frame =
+      (AgoraShmManagerAudioFrame *)malloc(sizeof(*frame) + len);
+  if (frame == NULL) {
+    return -ENOMEM;
+  }
+  frame->next = NULL;
+  frame->len = len;
+  frame->meta = *meta;
+  memcpy(frame->data, data, len);
+
+  if (e->audio_head != NULL &&
+      !manager_audio_same_format(&e->audio_head->meta, meta)) {
+    manager_audio_clear(e);
+  }
+  if (e->audio_head == NULL) {
+    e->audio_flush_ns = now_ns + AGORA_SHM_MANAGER_AUDIO_FLUSH_NS;
+  }
+  if (capacity < len) {
+    capacity = len; /* Preserve a single valid input even if longer than 200 ms. */
+  }
+  while (e->audio_head != NULL &&
+         (e->audio_bytes > capacity - len ||
+          e->audio_count >= AGORA_SHM_MANAGER_AUDIO_QUEUE_FRAMES)) {
+    manager_audio_pop(e);
+  }
+  if (e->audio_tail != NULL) {
+    e->audio_tail->next = frame;
+  } else {
+    e->audio_head = frame;
+  }
+  e->audio_tail = frame;
+  e->audio_bytes += len;
+  ++e->audio_count;
+  return 0;
 }
 
 static int manager_probe_shm_payload_size(const char *shm_name,
@@ -596,6 +729,69 @@ static int manager_send_datagram(AgoraShmManager *m, uint16_t type,
   return 0;
 }
 
+/* One commit per entry per deadline; never catch up by overwriting repeatedly. */
+static void manager_flush_audio(AgoraShmManager *m, uint64_t now_ns) {
+  for (int i = 0; i < AGORA_SHM_MANAGER_MAX_ENTRIES; ++i) {
+    (void)pthread_mutex_lock(&m->lock);
+    AgoraShmManagerWriteEntry *e = &m->write_entries[i];
+    if (e->in_use == 0 || e->removing != 0 || e->audio_head == NULL ||
+        now_ns < e->audio_flush_ns) {
+      (void)pthread_mutex_unlock(&m->lock);
+      continue;
+    }
+    e->audio_flush_ns = now_ns + AGORA_SHM_MANAGER_AUDIO_FLUSH_NS;
+    AgoraShmIpcFrameMeta meta = e->audio_head->meta;
+    size_t len = 0;
+    unsigned count = 0;
+    for (AgoraShmManagerAudioFrame *frame = e->audio_head;
+         frame != NULL && count < AGORA_SHM_MANAGER_AUDIO_BATCH_FRAMES;
+         frame = frame->next) {
+      if (!manager_audio_same_meta(&meta, &frame->meta) ||
+          frame->len > e->ipc.payload_size - len) {
+        break;
+      }
+      len += frame->len;
+      ++count;
+    }
+    if (len > e->audio_scratch_capacity) {
+      uint8_t *scratch = (uint8_t *)realloc(e->audio_scratch, len);
+      if (scratch == NULL) {
+        (void)pthread_mutex_unlock(&m->lock);
+        manager_log(m, "audio_buffer", ENOMEM, 0, 0);
+        continue;
+      }
+      e->audio_scratch = scratch;
+      e->audio_scratch_capacity = len;
+    }
+    size_t offset = 0;
+    AgoraShmManagerAudioFrame *frame = e->audio_head;
+    for (unsigned n = 0; n < count; ++n) {
+      memcpy(e->audio_scratch + offset, frame->data, frame->len);
+      offset += frame->len;
+      frame = frame->next;
+    }
+    int rc = agora_shm_ipc_write(&e->ipc, e->audio_scratch, len, &meta);
+    int error = errno;
+    uint64_t completed_ns;
+    if (mono_now_ns(&completed_ns) == 0) {
+      e->audio_flush_ns = completed_ns + AGORA_SHM_MANAGER_AUDIO_FLUSH_NS;
+    }
+    if (rc == 0) {
+      for (unsigned n = 0; n < count; ++n) {
+        manager_audio_pop(e);
+      }
+    }
+    (void)pthread_mutex_unlock(&m->lock);
+    if (rc != 0) {
+      manager_log(m, "audio_write", error, 0, 0);
+    } else if (manager_send_datagram(m, AGORA_LOCALSOCK_MSG_WRITECMD,
+                                     &meta, sizeof(meta)) != 0) {
+      /* Already committed: retrying the audio batch would duplicate samples. */
+      manager_log(m, "audio_notify", errno, 0, 0);
+    }
+  }
+}
+
 static void manager_worker_error(AgoraShmManager *m, const char *operation,
                                  int error, short events, unsigned *failures,
                                  int socket_error) {
@@ -678,6 +874,13 @@ static void *manager_worker(AgoraShmManager *m) {
   uint64_t last_ka_ns = 0;
 
   while (!manager_stopped(m)) {
+    uint64_t now_ns = 0;
+    if (mono_now_ns(&now_ns) != 0) {
+      manager_worker_error(m, "clock", errno, 0, &clock_failures, 0);
+      continue;
+    }
+    clock_failures = 0;
+    manager_flush_audio(m, now_ns);
     int rebuilt = manager_rebuild_transport(
         m, poll_failures > keepalive_failures ? poll_failures : keepalive_failures);
     if (rebuilt < 0) {
@@ -688,12 +891,6 @@ static void *manager_worker(AgoraShmManager *m) {
       last_ka_ns = 0;
     }
     if (!m->server_mode) {
-      uint64_t now_ns = 0;
-      if (mono_now_ns(&now_ns) != 0) {
-        manager_worker_error(m, "clock", errno, 0, &clock_failures, 0);
-        continue;
-      }
-      clock_failures = 0;
       if (last_ka_ns == 0 || now_ns - last_ka_ns >= 500000000ull) {
         (void)pthread_mutex_lock(&m->transport_lock);
         int rc = agora_localsock_client_send_keepalive(m->cli);
@@ -923,7 +1120,7 @@ void agora_shm_manager_close(AgoraShmManager *m) {
         preserve_state = 1;
       }
     }
-    memset(e, 0, sizeof(*e));
+    clear_write_entry(e);
   }
   (void)pthread_mutex_unlock(&m->lock);
 
@@ -1144,6 +1341,21 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
   }
 
   AgoraShmManagerWriteEntry *e = &m->write_entries[widx];
+  if (data == NULL || len > e->ipc.payload_size) {
+    int error = data == NULL ? EINVAL : EMSGSIZE;
+    (void)pthread_mutex_unlock(&m->lock);
+    errno = error;
+    return -errno;
+  }
+  if (meta->media_type == (uint32_t)AGORA_SHM_MEDIA_AUDIO) {
+    int rc = manager_audio_enqueue(e, data, len, meta);
+    (void)pthread_mutex_unlock(&m->lock);
+    if (rc != 0) {
+      errno = -rc;
+    }
+    return rc;
+  }
+  manager_audio_clear(e);
   if (agora_shm_ipc_write(&e->ipc, data, len, meta) != 0) {
     int err = errno;
     (void)pthread_mutex_unlock(&m->lock);

@@ -26,6 +26,7 @@ AGORA_MANAGER_DEMO := $(BUILD_DIR)/agora_manager_demo
 AGORA_LOCALSOCK_OBJ := $(BUILD_DIR)/agora_localsock.o
 AGORA_LOCALSOCK_DEMO := $(BUILD_DIR)/agora_localsock_demo
 AGORA_MANAGER_POLL_TEST := $(BUILD_DIR)/test_agora_shm_manager_poll
+AGORA_MANAGER_AUDIO_TEST := $(BUILD_DIR)/test_agora_shm_manager_audio
 AGORA_MANAGER_STATE_TEST := $(BUILD_DIR)/test_agora_shm_manager_state
 AGORA_MANAGER_RECOVERY_TEST := $(BUILD_DIR)/test_agora_shm_manager_recovery
 AGORA_MANAGER_BEST_EFFORT_TEST := $(BUILD_DIR)/test_agora_shm_manager_best_effort
@@ -71,6 +72,9 @@ $(AGORA_LOCALSOCK_DEMO): examples/agora_localsock_demo.c $(AGORA_LOCALSOCK_OBJ) 
 $(AGORA_MANAGER_POLL_TEST): tests/test_agora_shm_manager_poll.c $(AGORA_OBJ) $(AGORA_LOCALSOCK_OBJ) $(AGORA_MANAGER_STATE_TEST_OBJ) $(AGORA_MANAGER_TEST_OBJ) | $(BUILD_DIR)
 	$(CC) $(TEST_CFLAGS) -o $@ tests/test_agora_shm_manager_poll.c $(AGORA_OBJ) $(AGORA_LOCALSOCK_OBJ) $(AGORA_MANAGER_STATE_TEST_OBJ) $(AGORA_MANAGER_TEST_OBJ) $(LIBS)
 
+$(AGORA_MANAGER_AUDIO_TEST): tests/test_agora_shm_manager_audio.c tests/test_agora_shm_manager_poll.c src/agora_shm_manager.c src/agora_shm_manager.h src/agora_localsock_internal.h $(AGORA_OBJ) $(AGORA_LOCALSOCK_OBJ) $(AGORA_MANAGER_STATE_TEST_OBJ) | $(BUILD_DIR)
+	$(CC) $(TEST_CFLAGS) -o $@ tests/test_agora_shm_manager_audio.c $(AGORA_OBJ) $(AGORA_LOCALSOCK_OBJ) $(AGORA_MANAGER_STATE_TEST_OBJ) $(LIBS)
+
 $(AGORA_MANAGER_STATE_TEST): tests/test_agora_shm_manager_state.c $(AGORA_OBJ) $(AGORA_MANAGER_STATE_TEST_OBJ) | $(BUILD_DIR)
 	$(CC) $(TEST_CFLAGS) -o $@ tests/test_agora_shm_manager_state.c $(AGORA_OBJ) $(AGORA_MANAGER_STATE_TEST_OBJ) $(LIBS)
 
@@ -83,9 +87,10 @@ $(AGORA_LOCALSOCK_ERRORS_TEST): tests/test_agora_localsock_errors.c src/agora_lo
 $(AGORA_MANAGER_BEST_EFFORT_TEST): tests/test_agora_shm_manager_best_effort.c tests/test_agora_shm_manager_poll.c src/agora_shm_manager.c src/agora_shm_manager.h src/agora_shm_manager_state.h src/agora_localsock_internal.h $(AGORA_OBJ) $(AGORA_LOCALSOCK_OBJ) $(AGORA_MANAGER_STATE_TEST_OBJ) | $(BUILD_DIR)
 	$(CC) $(TEST_CFLAGS) -o $@ tests/test_agora_shm_manager_best_effort.c $(AGORA_OBJ) $(AGORA_LOCALSOCK_OBJ) $(AGORA_MANAGER_STATE_TEST_OBJ) $(LIBS)
 
-test: $(AGORA_MANAGER_STATE_TEST) $(AGORA_MANAGER_POLL_TEST) $(AGORA_MANAGER_RECOVERY_TEST) $(AGORA_LOCALSOCK_ERRORS_TEST) $(AGORA_MANAGER_BEST_EFFORT_TEST)
+test: $(AGORA_MANAGER_STATE_TEST) $(AGORA_MANAGER_POLL_TEST) $(AGORA_MANAGER_AUDIO_TEST) $(AGORA_MANAGER_RECOVERY_TEST) $(AGORA_LOCALSOCK_ERRORS_TEST) $(AGORA_MANAGER_BEST_EFFORT_TEST)
 	./$(AGORA_MANAGER_STATE_TEST)
 	./$(AGORA_MANAGER_POLL_TEST)
+	./$(AGORA_MANAGER_AUDIO_TEST)
 	./$(AGORA_MANAGER_RECOVERY_TEST)
 	./$(AGORA_LOCALSOCK_ERRORS_TEST)
 	./$(AGORA_MANAGER_BEST_EFFORT_TEST)

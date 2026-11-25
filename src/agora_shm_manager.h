@@ -72,6 +72,7 @@ int agora_shm_manager_start(agora_shm_manager_on_frame_fn on_frame,
  * Callers must stop new business API calls and wait for in-flight calls to
  * finish before close; never call close from on_frame. Close interrupts worker
  * retry/idle waits and joins recovery before releasing resources.
+ * Pending audio pre-buffer data is discarded, not drained, on close.
  */
 void agora_shm_manager_close(AgoraShmManager *m);
 
@@ -84,6 +85,8 @@ void agora_shm_manager_close(AgoraShmManager *m);
  * Persistent ownership registration is best effort: a state error is logged,
  * but the newly created SHM remains registered in the live write table and add
  * succeeds. Such objects may not be recoverable after abnormal process exit.
+ * For audio batching, allocate enough payload for the desired combined frames
+ * (up to four input frames); the receiver's max_read_cap must also fit the SHM.
  */
 int agora_shm_manager_add(AgoraShmManager *m, const char *shm_name,
                           size_t max_payload_size);
@@ -96,17 +99,32 @@ int agora_shm_manager_add(AgoraShmManager *m, const char *shm_name,
  * errno if absent in both. Local write cleanup still runs if notification
  * fails, and the first notification or SHM cleanup error is returned.
  * Persistent state-update errors are logged and do not fail removal.
+ * Pending audio for a removed writer is discarded and freed.
  */
 int agora_shm_manager_remove(AgoraShmManager *m, const char *shm_name);
 
 /**
- * Writes to a SHM IPC registered in the write table, then sends a WRITECMD
- * localsocket datagram (header + meta). meta must be non-NULL (EINVAL).
- * ENOENT if shm_name is not in the write table. If server mode has no UDP
- * peers yet, signaling succeeds with return 0. Notification failure returns
- * -errno even though the SHM data has already been written.
- * While the local transport is recovering, SHM is still written but signaling
- * returns -EAGAIN and sets errno=EAGAIN. There is no rollback or automatic replay.
+ * Submits data for a registered writer. data and meta must be non-NULL;
+ * ENOENT if shm_name is missing, EMSGSIZE if len exceeds the SHM payload size.
+ *
+ * Audio: copies data and metadata into a per-name pre-buffer. Zero means queued,
+ * not delivered; caller storage may be reused immediately. PCM metadata must
+ * have positive sample_rate/channels and positive bits divisible by 8; len must
+ * be nonzero and contain whole interleaved samples (otherwise EINVAL).
+ * The worker flushes on 10 ms monotonic deadlines, merging at most four matching
+ * input frames that fit the SHM payload into one commit and WRITECMD. Delayed
+ * ticks do not cause repeated catch-up commits. The queue retains at most
+ * 200 ms of PCM and 64 frames, dropping oldest whole frames on overflow. One
+ * oversized-duration input is retained if it fits SHM. Format changes discard
+ * queued data in the old format. Allocation/clock errors fail enqueue; later
+ * write/notification errors are logged asynchronously. During recovery, audio
+ * is still queued/flushed, without replaying already committed batches.
+ *
+ * Video/other media: immediately writes SHM, then sends WRITECMD. If server mode
+ * has no UDP peers, signaling returns 0. Notification failure returns -errno
+ * even though data has already been written; during recovery this is -EAGAIN.
+ * There is no rollback or automatic replay. Switching to non-audio discards any
+ * pending audio for that name. Single-slot SHM offers no delivery acknowledgement.
  */
 int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
                             const void *data, size_t len,
@@ -117,6 +135,8 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
  *
  * Available only when the manager was started with on_frame == NULL. Audio may
  * be consumed partially; video is copied only when the complete frame fits.
+ * Audio retains the latest 200 ms of PCM; a format change clears the old cache
+ * and recalculates its capacity. Video retains only the latest complete frame.
  * On a positive return, header is the latest accepted frame header with
  * header->data_len set to the returned byte count.
  *

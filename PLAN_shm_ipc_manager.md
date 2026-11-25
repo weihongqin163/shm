@@ -55,7 +55,7 @@ int agora_shm_manager_add(AgoraShmManager *m, const char *shm_name,
  *  本地读表项；皆无则 ENOENT。 */
 int agora_shm_manager_remove(AgoraShmManager *m, const char *shm_name);
 
-/** 写表项上 `agora_shm_ipc_write`，再发 localsock WRITECMD（头 + `AgoraShmIpcFrameMeta`）。 */
+/** 音频拷贝入 pre-buffer，由 worker 定时合并写入；视频立即写 SHM 并发送 WRITECMD。 */
 int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
                             const void *data, size_t len,
                             const AgoraShmIpcFrameMeta *meta);
@@ -78,6 +78,7 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
 - **一条** worker `pthread`。
 - **Server 模式**：在 transport 锁内非阻塞调用 **`agora_localsock_server_poll`**，收到数据后释锁进入 **`onIPCSignal`** 链路（见 3.4）。无数据时在锁外等待 10ms；client 采用相同的非阻塞收包与空闲等待方式。
 - **Client 模式**：循环 **`agora_localsock_client_poll`**（见 [`PLAN_localsocket.md`](PLAN_localsocket.md) 新增 API）+ 定时逻辑：除 poll 外，**每 500ms** 调用一次 **`agora_localsock_client_send_keepalive`**（由 manager 线程承担，**不**要求业务再驱动；与「独立使用 localsock 客户端时由业务发 keepalive」可并存——见 localsock PLAN 备注）。
+- **音频发送**：同一 worker 在 transport 恢复前检查各写槽的 **10ms 单调时间截止时间**；每次最多合并 4 个 metadata 一致且总长度能放入 SHM 的输入帧，写入一次并通知一次。延迟后只发一批，下一截止时间从当前时刻计算。
 - **`localsock_keepalive_ms`**：仅用于 **server** 侧 peer 超时（`5×`）；**不**作为上述 500ms 的来源。
 
 ### 3.2.1 通道自动恢复
@@ -89,8 +90,9 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
 - 只替换 localsock，保留端口、server 配置、SHM 映射、读写表、缓存和持久化
   所有权。失败重建每隔 20ms 重试，客户端重建后立即发送 keepalive。
 - `poll()` 在恢复期间先消费缓存，没有可读数据则返回 `-EAGAIN`；正常情况下
-  未挂接仍为 `-ENOENT`，缓存为空仍为 `0`。`write()` 先写 SHM，恢复期间通知
-  返回 `-EAGAIN`，不回滚。所有 manager 失败返回 `-errno` 并设置 `errno`。
+  未挂接仍为 `-ENOENT`，缓存为空仍为 `0`。音频 `write()` 拷贝入队，后续发送
+  错误异步记录；视频先写 SHM，恢复期间通知返回 `-EAGAIN`，不回滚。
+  所有 manager 同步失败返回 `-errno` 并设置 `errno`。
 - 日志输出到 stderr，不限流，不持业务锁或 transport 锁输出。
 - 上层先停止并等待业务 API 调用结束再 `close()`；close 唤醒等待、join worker
   后再释放资源。不得从帧回调中 close。等待使用单调时间。
@@ -120,7 +122,10 @@ int agora_shm_manager_write(AgoraShmManager *m, const char *shm_name,
 ### 3.7 WRITECMD 与 `agora_shm_manager_write`
 
 - **`msg_type == AGORA_LOCALSOCK_MSG_WRITECMD`（3）**：UDP 负载为 **`sizeof(AgoraShmIpcFrameMeta)`** 的裸 meta；接收侧若读表尚无该 `shm_name`，则 **`shm_open` + `mmap` 头** 探测 **`payload_size`** 后再 **`agora_shm_ipc_open` 附着读** 并 **`agora_shm_ipc_read` / `on_frame`**（与 APP 头镜像路径等价信息）。
-- **`agora_shm_manager_write`**：仅在**写表**命中 `shm_name` 时 **`agora_shm_ipc_write`**；随后 **server** 调用 **`agora_localsock_server_send_datagram`** 向已登记 peer **广播** WRITECMD；**client** 调用 **`agora_localsock_client_send_datagram`**。无 peer 时 server 侧信令 **返回 0**（写已成功）。**`meta` 不可为 NULL**（`EINVAL`）。
+- **`agora_shm_manager_write`**：仅在**写表**命中 `shm_name` 时接受数据；**`meta/data` 不可为 NULL**，单次长度不能超过 SHM payload。视频立即调用 `agora_shm_ipc_write` 并发送通知。
+- **音频 pre-buffer**：每个写槽持有独立 FIFO，拷贝 payload 和 metadata；返回 0 表示已入队。有效 PCM 输入必须非空且采样点对齐。每 10ms 最多合并 4 帧，合并长度不超过已登记 SHM 容量；要合并完整 4 帧需在 add 时预留容量。
+- **实时性**：发送端最多保留 200ms PCM 和 64 个输入帧，超限丢最旧完整帧；一个超过 200ms 但能放入 SHM 的输入可单独保留。格式变化清除旧队列，remove/close 释放未发送数据。接收端 poll 缓存保留最新 200ms，格式变化时清空并重新分配。
+- **通知**：写后 server 向已登记 peer 广播 WRITECMD，client 向 server 发送。server 无 peer 仍返回 0。音频异步发送失败记录日志，不重放已提交批次；单槽 SHM 仍无可靠交付确认。
 
 ### 3.8 REMOVECMD 与异常退出恢复
 
